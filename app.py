@@ -230,9 +230,7 @@ class OptionTradeModel:
         self.trained = False
         
     def prepare_features(self, df, spot_price):
-        features = []
-        for _, row in df.iterrows():
-            features.append([
+        features.append([
                 row['call_iv'] - row['put_iv'],  # IV Skew
                 row['call_oi_change'],
                 row['put_oi_change'],
@@ -240,8 +238,8 @@ class OptionTradeModel:
                 (row['put_ask'] - row['put_bid']) / row['put_ltp'] if row['put_ltp'] > 0 else 0,  # Put spread %
                 row['call_volume'] / (df['call_volume'].max() + 1e-6),  # Normalized volume
                 row['put_volume'] / (df['put_volume'].max() + 1e-6),
-                (spot_price - row['strike']) / spot_price if row['call_moneyness'] == 'OTM' else 0,  % OTM for calls
-                (row['strike'] - spot_price) / spot_price if row['put_moneyness'] == 'OTM' else 0,  % OTM for puts
+                (spot_price - row['strike']) / spot_price if row['call_moneyness'] == 'OTM' else 0,  # % OTM for calls
+                (row['strike'] - spot_price) / spot_price if row['put_moneyness'] == 'OTM' else 0,  # % OTM for puts
                 row['call_gamma'],
                 row['put_gamma']
             ])
