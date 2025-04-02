@@ -240,11 +240,32 @@ def generate_greeks_alerts(row):
 
 # Market Regime Detection
 def detect_market_regime(historical_iv):
-    returns = np.diff(np.log(historical_iv))
-    model = hmm.GaussianHMM(n_components=3, covariance_type="diag")
-    model.fit(returns.reshape(-1,1))
-    regimes = model.predict(returns.reshape(-1,1))
-    return regimes[-1]
+    try:
+        # Remove NaN values and ensure we have enough data
+        historical_iv = historical_iv[~np.isnan(historical_iv)]
+        if len(historical_iv) < 10:  # Need at least 10 data points
+            return 1  # Return "Normal" regime if not enough data
+        
+        # Convert to daily changes
+        returns = np.diff(np.log(historical_iv))
+        
+        # Remove any infinite values that might have crept in
+        returns = returns[np.isfinite(returns)]
+        
+        if len(returns) < 2:  # Need at least 2 returns for HMM
+            return 1  # Return "Normal" regime if not enough data
+            
+        # Fit HMM model
+        model = hmm.GaussianHMM(n_components=3, covariance_type="diag")
+        model.fit(returns.reshape(-1,1))
+        
+        # Predict regimes
+        regimes = model.predict(returns.reshape(-1,1))
+        
+        return regimes[-1]  # Return current regime
+    except Exception as e:
+        st.warning(f"Market regime detection failed: {str(e)}")
+        return 1  # Default to "Normal" regime if anything goes wrong
 
 # Put-Call Parity Arbitrage Detection
 def detect_arbitrage_opportunities(df, spot_price, risk_free_rate=0.05):
@@ -536,6 +557,7 @@ def main():
         st.markdown("</div>", unsafe_allow_html=True)
     
     # Market Regime Analysis
+try:
     regime = detect_market_regime(df['call_iv'].values)
     regimes = ["Low Volatility", "Normal", "High Volatility"]
     regime_class = ["regime-low", "regime-normal", "regime-high"][regime]
@@ -546,6 +568,8 @@ def main():
             <p>Implied Volatility: {df['call_iv'].mean():.1f}% | Expected Daily Move: ±{calculate_expected_move(spot_price, df['call_iv'].mean()):.1f} points</p>
         </div>
     """, unsafe_allow_html=True)
+except Exception as e:
+    st.warning(f"Could not determine market regime: {str(e)}")
     
     # Smart Money Flow
     smart_money = detect_smart_money_flow(df)
