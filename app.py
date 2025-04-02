@@ -358,8 +358,23 @@ def generate_trade_recommendations(df, spot_price, model, days_to_expiry=1):
     recommendations = []
     
     # Prepare features for ML model
-    X = model.prepare_features(df, spot_price)
-    df['ml_score'] = model.predict(X)
+    def prepare_features(self, df, spot_price):
+    features = []  # Initialize the features list
+    for _, row in df.iterrows():
+        features.append([
+            row['call_iv'] - row['put_iv'],  # IV Skew
+            row['call_oi_change'],
+            row['put_oi_change'],
+            (row['call_ask'] - row['call_bid']) / row['call_ltp'] if row['call_ltp'] > 0 else 0,  # Call spread %
+            (row['put_ask'] - row['put_bid']) / row['put_ltp'] if row['put_ltp'] > 0 else 0,  # Put spread %
+            row['call_volume'] / (df['call_volume'].max() + 1e-6),  # Normalized volume
+            row['put_volume'] / (df['put_volume'].max() + 1e-6),
+            (spot_price - row['strike']) / spot_price if row['call_moneyness'] == 'OTM' else 0,  # % OTM for calls
+            (row['strike'] - spot_price) / spot_price if row['put_moneyness'] == 'OTM' else 0,  # % OTM for puts
+            row['call_gamma'],
+            row['put_gamma']
+        ])
+    return np.array(features)
     
     # Get top ML-scored calls and puts
     top_calls = df[df['call_moneyness'] == 'OTM'].sort_values('ml_score', ascending=False).head(3)
