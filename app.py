@@ -4,13 +4,10 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 from datetime import datetime
-from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
-from hmmlearn.hmm import GaussianHMM
+import json
 from scipy.stats import norm
-import warnings
-
-warnings.filterwarnings('ignore')
 
 # Configure page
 st.set_page_config(
@@ -76,34 +73,26 @@ st.markdown("""
         margin-bottom: 10px;
         background-color: #40404f;
     }
-    .regime-low {
-        background-color: #e8f5e9;
-        border-left: 5px solid #2e7d32;
+    .probability-meter {
+        height: 20px;
+        background: linear-gradient(90deg, #e74c3c 0%, #f39c12 50%, #27ae60 100%);
+        border-radius: 10px;
+        margin: 10px 0;
+        position: relative;
     }
-    .regime-normal {
-        background-color: #fff3e0;
-        border-left: 5px solid #fb8c00;
+    .probability-indicator {
+        position: absolute;
+        height: 30px;
+        width: 2px;
+        background-color: black;
+        top: -5px;
     }
-    .regime-high {
-        background-color: #ffebee;
-        border-left: 5px solid #c62828;
-    }
-    .ml-signal {
-        font-weight: bold;
-        padding: 3px 6px;
-        border-radius: 4px;
-    }
-    .signal-buy {
-        background-color: #e8f5e9;
-        color: #2e7d32;
-    }
-    .signal-sell {
-        background-color: #ffebee;
-        color: #c62828;
-    }
-    .signal-neutral {
-        background-color: #e3f2fd;
-        color: #1565c0;
+    .risk-metric {
+        padding: 15px;
+        border-radius: 5px;
+        margin-bottom: 15px;
+        background-color: #f8f9fa;
+        border-left: 5px solid #6c757d;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -116,78 +105,32 @@ HEADERS = {
     "content-type": "application/json"
 }
 
-# Constants
-RISK_FREE_RATE = 0.05
-DAYS_IN_YEAR = 365
-
-# Machine Learning Model for Trade Signals
-class OptionTradeModel:
-    def __init__(self):
-        self.model = GradientBoostingClassifier(n_estimators=100, learning_rate=0.1, max_depth=3, random_state=42)
-        self.scaler = StandardScaler()
-        self.trained = False
-        
-    def prepare_features(self, df, spot_price):
-        features = []
-        for _, row in df.iterrows():
-            features.append([
-                row['call_iv'] - row['put_iv'],
-                row['call_oi_change'],
-                row['put_oi_change'],
-                (row['call_ask'] - row['call_bid']) / row['call_ltp'] if row['call_ltp'] > 0 else 0,
-                (row['put_ask'] - row['put_bid']) / row['put_ltp'] if row['put_ltp'] > 0 else 0,
-                row['call_volume'] / (df['call_volume'].max() + 1e-6),
-                row['put_volume'] / (df['put_volume'].max() + 1e-6),
-                (spot_price - row['strike']) / spot_price if row['call_moneyness'] == 'OTM' else 0,
-                (row['strike'] - spot_price) / spot_price if row['put_moneyness'] == 'OTM' else 0,
-                row['call_gamma'],
-                row['put_gamma']
-            ])
-        return np.array(features)
-    
-    def train(self, X, y):
-        X_scaled = self.scaler.fit_transform(X)
-        self.model.fit(X_scaled, y)
-        self.trained = True
-        
-    def predict(self, X):
-        if not self.trained:
-            return np.zeros(X.shape[0])
-        X_scaled = self.scaler.transform(X)
-        return self.model.predict_proba(X_scaled)[:, 1]
-    
-    def feature_importance(self):
-        if not self.trained:
-            return None
-        return self.model.feature_importances_
-
-# Market Regime Detection
-class MarketRegimeDetector:
-    def __init__(self, n_states=3):
-        self.model = GaussianHMM(n_components=n_states, covariance_type="diag", n_iter=1000, random_state=42)
-        self.regime_map = {0: "Low Volatility", 1: "Normal", 2: "High Volatility"}
-        
-    def fit(self, historical_data):
-        self.model.fit(historical_data[['iv', 'volume', 'returns']].values.reshape(-1, 3))
-        
-    def predict_regime(self, current_data):
-        regime = self.model.predict(np.array([[current_data['iv'], current_data['volume'], current_data['returns']]]))
-        return self.regime_map[regime[0]]
-    
-    def get_expected_move(self, current_iv, days_to_expiry):
-        return current_iv * np.sqrt(days_to_expiry / DAYS_IN_YEAR)
-
-# Helper Functions
+# Fetch data from API
+@st.cache_data(ttl=300)  # Cache for 5 minutes
 def fetch_options_data(asset_key="NSE_INDEX|Nifty 50", expiry="03-04-2025"):
     url = f"{BASE_URL}/strategy-chains?assetKey={asset_key}&strategyChainType=PC_CHAIN&expiry={expiry}"
     response = requests.get(url, headers=HEADERS)
-    return response.json() if response.status_code == 200 else None
+    
+    if response.status_code == 200:
+        return response.json()
+    else:
+        st.error(f"Failed to fetch data: {response.status_code} - {response.text}")
+        return None
 
+# Fetch live Nifty price
+@st.cache_data(ttl=60)  # Cache for 1 minute
 def fetch_nifty_price():
     url = f"{MARKET_DATA_URL}?i=NSE_INDEX|Nifty%2050"
     response = requests.get(url, headers=HEADERS)
-    return response.json()['data']['lastPrice'] if response.status_code == 200 else None
+    
+    if response.status_code == 200:
+        data = response.json()
+        return data['data']['lastPrice']
+    else:
+        st.error(f"Failed to fetch Nifty price: {response.status_code} - {response.text}")
+        return None
 
+# Process raw API data
 def process_options_data(raw_data, spot_price):
     if not raw_data or 'data' not in raw_data:
         return None
@@ -199,8 +142,11 @@ def process_options_data(raw_data, spot_price):
         call_data = data.get('callOptionData', {})
         put_data = data.get('putOptionData', {})
         
+        # Market data
         call_market = call_data.get('marketData', {})
         put_market = put_data.get('marketData', {})
+        
+        # Analytics data
         call_analytics = call_data.get('analytics', {})
         put_analytics = put_data.get('analytics', {})
         
@@ -209,8 +155,12 @@ def process_options_data(raw_data, spot_price):
         processed_data.append({
             'strike': strike_float,
             'pcr': data.get('pcr', 0),
+            
+            # Moneyness
             'call_moneyness': 'ITM' if strike_float < spot_price else ('ATM' if strike_float == spot_price else 'OTM'),
             'put_moneyness': 'ITM' if strike_float > spot_price else ('ATM' if strike_float == spot_price else 'OTM'),
+            
+            # Call data
             'call_ltp': call_market.get('ltp', 0),
             'call_bid': call_market.get('bidPrice', 0),
             'call_ask': call_market.get('askPrice', 0),
@@ -223,6 +173,8 @@ def process_options_data(raw_data, spot_price):
             'call_gamma': call_analytics.get('gamma', 0),
             'call_theta': call_analytics.get('theta', 0),
             'call_vega': call_analytics.get('vega', 0),
+            
+            # Put data
             'put_ltp': put_market.get('ltp', 0),
             'put_bid': put_market.get('bidPrice', 0),
             'put_ask': put_market.get('askPrice', 0),
@@ -239,26 +191,222 @@ def process_options_data(raw_data, spot_price):
     
     return pd.DataFrame(processed_data)
 
+# Get top ITM/OTM strikes
+def get_top_strikes(df, spot_price, n=5):
+    # For calls: ITM = strike < spot, OTM = strike > spot
+    call_itm = df[df['strike'] < spot_price].sort_values('strike', ascending=False).head(n)
+    call_otm = df[df['strike'] > spot_price].sort_values('strike', ascending=True).head(n)
+    
+    # For puts: ITM = strike > spot, OTM = strike < spot
+    put_itm = df[df['strike'] > spot_price].sort_values('strike', ascending=True).head(n)
+    put_otm = df[df['strike'] < spot_price].sort_values('strike', ascending=False).head(n)
+    
+    return {
+        'call_itm': call_itm,
+        'call_otm': call_otm,
+        'put_itm': put_itm,
+        'put_otm': put_otm
+    }
+
+# Calculate probability of profit
+def calculate_pop(strike, premium, spot_price, iv, days_to_expiry, is_call=True):
+    if days_to_expiry <= 0 or iv <= 0:
+        return 0.5  # Neutral probability if data is invalid
+    
+    # Convert IV from percentage to decimal
+    iv_decimal = iv / 100
+    
+    # Calculate break-even price
+    if is_call:
+        breakeven = strike + premium
+    else:
+        breakeven = strike - premium
+    
+    # Calculate expected move
+    annualized_vol = iv_decimal * np.sqrt(365)
+    daily_vol = annualized_vol / np.sqrt(365)
+    expected_move = spot_price * daily_vol * np.sqrt(days_to_expiry)
+    
+    # Calculate z-score
+    if is_call:
+        z = (breakeven - spot_price) / (spot_price * iv_decimal * np.sqrt(days_to_expiry/365))
+    else:
+        z = (spot_price - breakeven) / (spot_price * iv_decimal * np.sqrt(days_to_expiry/365))
+    
+    # Calculate probability using normal CDF
+    pop = norm.cdf(z)
+    
+    return pop
+
+# Calculate expected move
+def calculate_expected_move(spot_price, iv, days_to_expiry):
+    if days_to_expiry <= 0 or iv <= 0:
+        return (spot_price, spot_price)  # Neutral if data is invalid
+    
+    # Convert IV from percentage to decimal
+    iv_decimal = iv / 100
+    
+    # Calculate expected move (1 standard deviation)
+    move = spot_price * iv_decimal * np.sqrt(days_to_expiry/365)
+    upper = spot_price + move
+    lower = spot_price - move
+    
+    return (lower, upper)
+
+# Generate trade recommendations with risk metrics
+def generate_trade_recommendations(df, spot_price, days_to_expiry=7):
+    recommendations = []
+    
+    # Calculate metrics for all strikes
+    df['call_premium_ratio'] = (df['call_ask'] - df['call_bid']) / df['call_ltp']
+    df['put_premium_ratio'] = (df['put_ask'] - df['put_bid']) / df['put_ltp']
+    df['call_risk_reward'] = (spot_price - df['strike'] + df['call_ltp']) / df['call_ltp']
+    df['put_risk_reward'] = (df['strike'] - spot_price + df['put_ltp']) / df['put_ltp']
+    
+    # Find best calls to buy (low premium ratio, high OI change, good risk/reward)
+    best_calls = df[(df['call_moneyness'] == 'OTM') & 
+                   (df['call_premium_ratio'] < 0.1) &
+                   (df['call_oi_change'] > 0)].sort_values(
+        by=['call_premium_ratio', 'call_oi_change'], 
+        ascending=[True, False]
+    ).head(3)
+    
+    for _, row in best_calls.iterrows():
+        pop = calculate_pop(row['strike'], row['call_ltp'], spot_price, row['call_iv'], days_to_expiry, is_call=True)
+        lower_move, upper_move = calculate_expected_move(spot_price, row['call_iv'], days_to_expiry)
+        
+        recommendations.append({
+            'type': 'BUY CALL',
+            'strike': row['strike'],
+            'premium': row['call_ltp'],
+            'iv': row['call_iv'],
+            'oi_change': row['call_oi_change'],
+            'risk_reward': f"{row['call_risk_reward']:.1f}:1",
+            'reason': "Low spread, OI buildup, good risk/reward",
+            'pop': pop,
+            'expected_lower': lower_move,
+            'expected_upper': upper_move
+        })
+    
+    # Find best puts to buy (low premium ratio, high OI change, good risk/reward)
+    best_puts = df[(df['put_moneyness'] == 'OTM') & 
+                  (df['put_premium_ratio'] < 0.1) &
+                  (df['put_oi_change'] > 0)].sort_values(
+        by=['put_premium_ratio', 'put_oi_change'], 
+        ascending=[True, False]
+    ).head(3)
+    
+    for _, row in best_puts.iterrows():
+        pop = calculate_pop(row['strike'], row['put_ltp'], spot_price, row['put_iv'], days_to_expiry, is_call=False)
+        lower_move, upper_move = calculate_expected_move(spot_price, row['put_iv'], days_to_expiry)
+        
+        recommendations.append({
+            'type': 'BUY PUT',
+            'strike': row['strike'],
+            'premium': row['put_ltp'],
+            'iv': row['put_iv'],
+            'oi_change': row['put_oi_change'],
+            'risk_reward': f"{row['put_risk_reward']:.1f}:1",
+            'reason': "Low spread, OI buildup, good risk/reward",
+            'pop': pop,
+            'expected_lower': lower_move,
+            'expected_upper': upper_move
+        })
+    
+    # Find best calls to sell (high premium ratio, decreasing OI)
+    best_sell_calls = df[(df['call_moneyness'] == 'ITM') & 
+                        (df['call_premium_ratio'] > 0.15) &
+                        (df['call_oi_change'] < 0)].sort_values(
+        by=['call_premium_ratio', 'call_oi_change'], 
+        ascending=[False, True]
+    ).head(2)
+    
+    for _, row in best_sell_calls.iterrows():
+        pop = calculate_pop(row['strike'], row['call_ltp'], spot_price, row['call_iv'], days_to_expiry, is_call=True)
+        lower_move, upper_move = calculate_expected_move(spot_price, row['call_iv'], days_to_expiry)
+        
+        recommendations.append({
+            'type': 'SELL CALL',
+            'strike': row['strike'],
+            'premium': row['call_ltp'],
+            'iv': row['call_iv'],
+            'oi_change': row['call_oi_change'],
+            'risk_reward': f"{1/row['call_risk_reward']:.1f}:1",
+            'reason': "High spread, OI unwinding, favorable risk",
+            'pop': pop,
+            'expected_lower': lower_move,
+            'expected_upper': upper_move
+        })
+    
+    # Find best puts to sell (high premium ratio, decreasing OI)
+    best_sell_puts = df[(df['put_moneyness'] == 'ITM') & 
+                       (df['put_premium_ratio'] > 0.15) &
+                       (df['put_oi_change'] < 0)].sort_values(
+        by=['put_premium_ratio', 'put_oi_change'], 
+        ascending=[False, True]
+    ).head(2)
+    
+    for _, row in best_sell_puts.iterrows():
+        pop = calculate_pop(row['strike'], row['put_ltp'], spot_price, row['put_iv'], days_to_expiry, is_call=False)
+        lower_move, upper_move = calculate_expected_move(spot_price, row['put_iv'], days_to_expiry)
+        
+        recommendations.append({
+            'type': 'SELL PUT',
+            'strike': row['strike'],
+            'premium': row['put_ltp'],
+            'iv': row['put_iv'],
+            'oi_change': row['put_oi_change'],
+            'risk_reward': f"{1/row['put_risk_reward']:.1f}:1",
+            'reason': "High spread, OI unwinding, favorable risk",
+            'pop': pop,
+            'expected_lower': lower_move,
+            'expected_upper': upper_move
+        })
+    
+    return recommendations
+
+# Train predictive model (simplified example)
+def train_price_direction_model(df):
+    # This is a simplified example - in a real app you'd use more sophisticated features
+    try:
+        # Create target variable (1 if call OI increase > put OI increase, else 0)
+        df['target'] = (df['call_oi_change'] > df['put_oi_change']).astype(int)
+        
+        # Select features
+        features = ['pcr', 'call_oi_change', 'put_oi_change', 'call_iv', 'put_iv']
+        X = df[features].fillna(0)
+        y = df['target']
+        
+        # Train model
+        model = RandomForestClassifier(n_estimators=100, random_state=42)
+        model.fit(X, y)
+        
+        return model, features
+    except Exception as e:
+        st.error(f"Model training failed: {str(e)}")
+        return None, None
+
+# Generate price direction prediction
+def predict_price_direction(model, features, df):
+    try:
+        X = df[features].fillna(0)
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+        
+        proba = model.predict_proba(X_scaled)[0]
+        prediction = model.predict(X_scaled)[0]
+        
+        return {
+            'direction': 'Up' if prediction == 1 else 'Down',
+            'confidence': max(proba[0], proba[1])
+        }
+    except Exception as e:
+        st.error(f"Prediction failed: {str(e)}")
+        return None
+
 # Main App
 def main():
     st.markdown("<div class='header'><h1>📊 PyStatIQ Options Chain Dashboard</h1></div>", unsafe_allow_html=True)
-    
-    # Initialize models
-    trade_model = OptionTradeModel()
-    regime_detector = MarketRegimeDetector()
-    
-    # Simulate training data (in practice, you'd use historical data)
-    X_train = np.random.rand(100, 10)  # 100 samples, 10 features
-    y_train = np.random.randint(0, 2, 100)  # Binary labels
-    trade_model.train(X_train, y_train)
-    
-    # Simulate regime detection training
-    historical_data = pd.DataFrame({
-        'iv': np.random.uniform(10, 50, 100),
-        'volume': np.random.uniform(1e6, 1e7, 100),
-        'returns': np.random.normal(0, 0.01, 100)
-    })
-    regime_detector.fit(historical_data)
     
     # Fetch spot price
     spot_price = fetch_nifty_price()
@@ -280,7 +428,7 @@ def main():
             datetime.strptime("03-04-2025", "%d-%m-%Y")
         ).strftime("%d-%m-%Y")
         
-        days_to_expiry = st.number_input("Days to Expiry", min_value=1, max_value=30, value=1)
+        days_to_expiry = st.number_input("Days to Expiry", min_value=1, max_value=30, value=7)
         
         st.markdown("---")
         st.markdown(f"**Current Nifty Spot Price: {spot_price:,.2f}**")
@@ -292,7 +440,7 @@ def main():
         
         st.markdown("---")
         st.markdown("**About**")
-        st.markdown("Advanced options analytics dashboard with ML signals, risk metrics, and smart money detection.")
+        st.markdown("This dashboard provides real-time options chain analysis using data.")
     
     # Fetch and process data
     with st.spinner("Fetching live options data..."):
@@ -307,25 +455,14 @@ def main():
         st.error("No data available for the selected parameters.")
         return
     
+    # Train predictive model
+    model, features = train_price_direction_model(df)
+    
     # Get top strikes
     top_strikes = get_top_strikes(df, spot_price)
     
     # Default strike selection (ATM)
     atm_strike = df.iloc[(df['strike'] - spot_price).abs().argsort()[:1]]['strike'].values[0]
-    
-    # Market Regime Detection
-    current_volatility = df['call_iv'].mean()  # Using average call IV as proxy
-    current_volume = df['call_volume'].sum() + df['put_volume'].sum()
-    current_return = 0  # Would normally get from historical data
-    
-    regime = regime_detector.predict_regime({
-        'iv': current_volatility,
-        'volume': current_volume,
-        'returns': current_return
-    })
-    
-    expected_move_pct = regime_detector.get_expected_move(current_volatility, days_to_expiry)
-    expected_move_points = spot_price * expected_move_pct
     
     # Main columns
     col1, col2, col3 = st.columns([1, 2, 1])
@@ -351,14 +488,18 @@ def main():
             index=int(np.where(df['strike'].unique() == atm_strike)[0][0])
         )
         
-        # Market regime display
-        regime_class = "regime-low" if "Low" in regime else ("regime-high" if "High" in regime else "regime-normal")
-        st.markdown(f"""
-            <div class='metric-card {regime_class}'>
-                <h3>Market Regime: {regime}</h3>
-                <p>Expected Move: ±{expected_move_pct:.2%} (±{expected_move_points:.0f} points)</p>
-            </div>
-        """, unsafe_allow_html=True)
+        # PCR gauge
+        pcr = df[df['strike'] == selected_strike]['pcr'].values[0]
+        fig = px.bar(x=[pcr], range_x=[0, 2], title=f"Put-Call Ratio: {pcr:.2f}")
+        fig.update_layout(
+            xaxis_title="PCR",
+            yaxis_visible=False,
+            height=150,
+            margin=dict(l=20, r=20, t=40, b=20)
+        )
+        fig.add_vline(x=0.7, line_dash="dot", line_color="green")
+        fig.add_vline(x=1.3, line_dash="dot", line_color="red")
+        st.plotly_chart(fig, use_container_width=True)
     
     with col3:
         st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
@@ -423,23 +564,26 @@ def main():
                 </div>
             """, unsafe_allow_html=True)
     
-    # Trade Recommendations with ML
-    st.markdown("### AI-Powered Trade Recommendations")
-    recommendations, df_with_scores = generate_trade_recommendations(df, spot_price, trade_model, days_to_expiry)
+    # Trade Recommendations with Risk Metrics
+    st.markdown("### Trade Recommendations with Risk Metrics")
+    recommendations = generate_trade_recommendations(df, spot_price, days_to_expiry)
     
     if recommendations:
         for rec in recommendations:
             is_sell = 'SELL' in rec['type']
-            ml_score_class = "signal-buy" if rec['ml_score'] > 0.7 else ("signal-sell" if rec['ml_score'] < 0.3 else "signal-neutral")
+            pop_percent = rec['pop'] * 100
             
             st.markdown(f"""
                 <div class='trade-recommendation{' sell' if is_sell else ''}'>
-                    <h4>{rec['type']} @ {rec['strike']:.0f} 
-                        <span class='ml-signal {ml_score_class}'>ML Score: {rec['ml_score']:.2f}</span>
-                        <span style='float:right;'>Prob Profit: {rec['pop']:.1%}</span>
-                    </h4>
+                    <h4>{rec['type']} @ {rec['strike']:.0f}</h4>
                     <p>
-                        Premium: {rec['premium']:.2f} | IV: {rec['iv']:.1f}% | OI Change: {rec['oi_change']:,}<br>
+                        Premium: {rec['premium']:.2f} | IV: {rec['iv']:.1f}%<br>
+                        OI Change: {rec['oi_change']:,} | Risk/Reward: {rec['risk_reward']}<br>
+                        <b>Probability of Profit:</b> {pop_percent:.1f}%
+                        <div class='probability-meter'>
+                            <div class='probability-indicator' style='left: {pop_percent}%;'></div>
+                        </div>
+                        <b>Expected Move:</b> {rec['expected_lower']:.1f} to {rec['expected_upper']:.1f}<br>
                         <b>Reason:</b> {rec['reason']}
                     </p>
                 </div>
@@ -532,161 +676,130 @@ def main():
     with tab3:
         st.markdown("### Advanced Analytics")
         
+        # IV Skew Analysis
+        st.markdown("#### IV Skew Analysis")
+        fig = px.line(
+            df,
+            x='strike',
+            y=['call_iv', 'put_iv'],
+            title='Implied Volatility Skew',
+            labels={'value': 'IV (%)', 'strike': 'Strike Price'},
+            color_discrete_map={'call_iv': '#3498db', 'put_iv': '#e74c3c'}
+        )
+        fig.add_vline(x=spot_price, line_dash="dash", line_color="gray")
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Risk Analysis
+        st.markdown("#### Risk Analysis")
+        
+        # Max pain calculation
+        pain_points = []
+        for strike in df['strike'].unique():
+            strike_row = df[df['strike'] == strike].iloc[0]
+            pain_points.append((strike, strike_row['call_oi'] + strike_row['put_oi']))
+        
+        max_pain_strike = min(pain_points, key=lambda x: x[1])[0] if pain_points else selected_strike
+        
         col1, col2 = st.columns(2)
         
         with col1:
-            # Arbitrage Opportunities
-            st.markdown("#### Arbitrage Opportunities")
-            arbitrage_ops = detect_arbitrage_opportunities(df, spot_price, RISK_FREE_RATE, days_to_expiry)
+            st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
+            st.markdown("**Maximum Pain**")
+            st.markdown(f"Current Strike: {selected_strike}")
+            st.markdown(f"Max Pain Strike: {max_pain_strike}")
             
-            if not arbitrage_ops.empty:
-                st.dataframe(
-                    arbitrage_ops.style.format({
-                        'call_price': '{:.2f}',
-                        'put_price': '{:.2f}',
-                        'theoretical_diff': '{:.2f}',
-                        'actual_diff': '{:.2f}',
-                        'arbitrage_amount': '{:.2f}'
-                    }),
-                    use_container_width=True
-                )
+            if abs(max_pain_strike - selected_strike) <= (all_strikes[1] - all_strikes[0]) * 2:
+                st.warning("Close to max pain - increased pin risk")
             else:
-                st.info("No significant arbitrage opportunities detected")
+                st.success("Not near max pain level")
             
-            # Smart Money Flows
-            st.markdown("#### Smart Money Flow Detection")
-            smart_money = detect_smart_money_flows(df, spot_price, volume_threshold, oi_change_threshold)
-            
-            if not smart_money.empty:
-                st.dataframe(
-                    smart_money.style.format({
-                        'volume': '{:,}',
-                        'oi_change': '{:,}',
-                        'iv': '{:.1f}%'
-                    }),
-                    use_container_width=True
-                )
-            else:
-                st.info("No unusual smart money activity detected")
+            st.markdown("</div>", unsafe_allow_html=True)
         
         with col2:
-            # IV Skew Analysis
-            st.markdown("#### IV Skew Analysis")
-            fig = px.line(
-                df,
-                x='strike',
-                y=['call_iv', 'put_iv'],
-                title='Implied Volatility Skew',
-                labels={'value': 'IV (%)', 'strike': 'Strike Price'},
-                color_discrete_map={'call_iv': '#3498db', 'put_iv': '#e74c3c'}
-            )
-            fig.add_vline(x=spot_price, line_dash="dash", line_color="gray")
-            st.plotly_chart(fig, use_container_width=True)
+            st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
+            st.markdown("**Gamma Exposure**")
             
-            # Greeks Exposure
-            st.markdown("#### Greeks Exposure")
-            fig = px.line(
-                df,
-                x='strike',
-                y=['call_gamma', 'put_gamma', 'call_theta', 'put_theta'],
-                title='Gamma and Theta Exposure',
-                labels={'value': 'Value', 'strike': 'Strike Price'},
-                color_discrete_map={
-                    'call_gamma': '#3498db', 
-                    'put_gamma': '#e74c3c',
-                    'call_theta': '#2ecc71',
-                    'put_theta': '#f39c12'
-                }
-            )
-            fig.add_vline(x=spot_price, line_dash="dash", line_color="gray")
-            st.plotly_chart(fig, use_container_width=True)
+            net_gamma = strike_data['call_gamma'] - strike_data['put_gamma']
+            if net_gamma > 0:
+                st.info("Positive Gamma: Market makers likely to buy on dips, sell on rallies")
+            else:
+                st.warning("Negative Gamma: Market makers likely to sell on dips, buy on rallies")
+            
+            st.markdown(f"Net Gamma: {net_gamma:.4f}")
+            st.markdown("</div>", unsafe_allow_html=True)
+        
+        # Probability calculator
+        st.markdown("#### Probability Calculator")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            target_price = st.number_input("Target Price", value=spot_price * 1.02, min_value=0.0)
+        
+        with col2:
+            days = st.number_input("Time Horizon (days)", value=days_to_expiry, min_value=1, max_value=30)
+        
+        # Calculate probability using selected strike's IV (simplified)
+        if strike_data['call_iv'] > 0 and strike_data['put_iv'] > 0:
+            avg_iv = (strike_data['call_iv'] + strike_data['put_iv']) / 2
+            z_score = (target_price - spot_price) / (spot_price * (avg_iv/100) * np.sqrt(days/365))
+            prob = norm.cdf(z_score) if target_price > spot_price else 1 - norm.cdf(z_score)
+            
+            st.markdown(f"""
+                <div class='risk-metric'>
+                    <h4>Probability Analysis</h4>
+                    <p>Probability of reaching {target_price:,.2f} in {days} days: <b>{prob*100:.1f}%</b></p>
+                    <p>Using average IV: {avg_iv:.1f}%</p>
+                </div>
+            """, unsafe_allow_html=True)
     
     with tab4:
-        st.markdown("### Predictive Models & ML Signals")
+        st.markdown("### Predictive Models")
         
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            # ML Model Feature Importance
-            st.markdown("#### Model Feature Importance")
-            feature_importance = trade_model.feature_importance()
-            if feature_importance is not None:
-                features = [
-                    'IV Skew', 'Call OI Change', 'Put OI Change', 
-                    'Call Spread %', 'Put Spread %', 'Call Volume', 
-                    'Put Volume', '% OTM Call', '% OTM Put',
-                    'Call Gamma', 'Put Gamma'
-                ]
-                importance_df = pd.DataFrame({
-                    'Feature': features,
-                    'Importance': feature_importance
-                }).sort_values('Importance', ascending=False)
-                
-                fig = px.bar(
-                    importance_df,
-                    x='Importance',
-                    y='Feature',
-                    orientation='h',
-                    title='Feature Importance in Trade Model'
-                )
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("Model not trained or feature importance not available")
+        if model is not None:
+            # Get prediction for current market conditions
+            prediction = predict_price_direction(model, features, df)
             
-            # ML Scores Distribution
-            st.markdown("#### ML Scores Distribution")
-            if 'ml_score' in df_with_scores.columns:
-                fig = px.histogram(
-                    df_with_scores,
-                    x='ml_score',
-                    nbins=20,
-                    title='Distribution of ML Scores Across Strikes',
-                    labels={'ml_score': 'ML Score (0-1)'}
-                )
-                st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            # Top ML-Scored Calls
-            st.markdown("#### Top ML-Scored Calls")
-            top_calls = df_with_scores[df_with_scores['call_moneyness'] == 'OTM'].sort_values('ml_score', ascending=False).head(10)
-            st.dataframe(
-                top_calls[['strike', 'call_ltp', 'call_iv', 'call_oi_change', 'ml_score']]
-                .rename(columns={
-                    'strike': 'Strike',
-                    'call_ltp': 'Price',
-                    'call_iv': 'IV',
-                    'call_oi_change': 'OI Change',
-                    'ml_score': 'ML Score'
-                })
-                .style.format({
-                    'Price': '{:.2f}',
-                    'IV': '{:.1f}%',
-                    'OI Change': '{:,}',
-                    'ML Score': '{:.2f}'
-                }),
-                use_container_width=True
-            )
+            if prediction:
+                st.markdown(f"""
+                    <div class='prediction-card'>
+                        <h3>Price Direction Prediction</h3>
+                        <p>Next 1-3 days: <b>{prediction['direction']}</b></p>
+                        <p>Confidence: <b>{prediction['confidence']*100:.1f}%</b></p>
+                    </div>
+                """, unsafe_allow_html=True)
             
-            # Top ML-Scored Puts
-            st.markdown("#### Top ML-Scored Puts")
-            top_puts = df_with_scores[df_with_scores['put_moneyness'] == 'OTM'].sort_values('ml_score', ascending=False).head(10)
-            st.dataframe(
-                top_puts[['strike', 'put_ltp', 'put_iv', 'put_oi_change', 'ml_score']]
-                .rename(columns={
-                    'strike': 'Strike',
-                    'put_ltp': 'Price',
-                    'put_iv': 'IV',
-                    'put_oi_change': 'OI Change',
-                    'ml_score': 'ML Score'
-                })
-                .style.format({
-                    'Price': '{:.2f}',
-                    'IV': '{:.1f}%',
-                    'OI Change': '{:,}',
-                    'ML Score': '{:.2f}'
-                }),
-                use_container_width=True
+            # Feature importance
+            st.markdown("#### Feature Importance")
+            feature_importances = pd.DataFrame({
+                'Feature': features,
+                'Importance': model.feature_importances_
+            }).sort_values('Importance', ascending=False)
+            
+            fig = px.bar(
+                feature_importances,
+                x='Importance',
+                y='Feature',
+                orientation='h',
+                title='Model Feature Importance'
             )
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Model explanation
+            st.markdown("""
+                <div class='risk-metric'>
+                    <h4>Model Explanation</h4>
+                    <p>This predictive model analyzes options chain data to forecast short-term price direction.</p>
+                    <p>Key factors considered:</p>
+                    <ul>
+                        <li>Put-Call Ratio (PCR)</li>
+                        <li>Open Interest changes</li>
+                        <li>Implied Volatility differences</li>
+                    </ul>
+                    <p>The model is a Random Forest classifier trained on historical options data.</p>
+                </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.warning("Could not load predictive model. Please check data availability.")
 
 if __name__ == "__main__":
     main()
