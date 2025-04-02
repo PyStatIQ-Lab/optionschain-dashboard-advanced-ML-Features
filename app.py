@@ -193,6 +193,7 @@ def process_options_data(raw_data, spot_price):
 
 # Get top ITM/OTM strikes
 def get_top_strikes(df, spot_price, n=5):
+    """Safely get top ITM/OTM strikes with proper error handling"""
     result = {
         'call_itm': pd.DataFrame(),
         'call_otm': pd.DataFrame(),
@@ -202,14 +203,121 @@ def get_top_strikes(df, spot_price, n=5):
     
     try:
         if df is not None and not df.empty:
-            result['call_itm'] = df[df['strike'] < spot_price].sort_values('strike', ascending=False).head(n)
-            result['call_otm'] = df[df['strike'] > spot_price].sort_values('strike', ascending=True).head(n)
-            result['put_itm'] = df[df['strike'] > spot_price].sort_values('strike', ascending=True).head(n)
-            result['put_otm'] = df[df['strike'] < spot_price].sort_values('strike', ascending=False).head(n)
+            # Filter and sort calls
+            if 'strike' in df.columns and 'call_ltp' in df.columns:
+                result['call_itm'] = df[df['strike'] < spot_price].sort_values('strike', ascending=False).head(n)
+                result['call_otm'] = df[df['strike'] > spot_price].sort_values('strike', ascending=True).head(n)
+            
+            # Filter and sort puts
+            if 'strike' in df.columns and 'put_ltp' in df.columns:
+                result['put_itm'] = df[df['strike'] > spot_price].sort_values('strike', ascending=True).head(n)
+                result['put_otm'] = df[df['strike'] < spot_price].sort_values('strike', ascending=False).head(n)
+                
     except Exception as e:
-        st.warning(f"Error processing top strikes: {str(e)}")
+        st.error(f"Error processing top strikes: {str(e)}")
     
     return result
+
+def display_top_strikes(top_strikes):
+    """Safely display the top strikes section with validation"""
+    try:
+        if not top_strikes or any(key not in top_strikes for key in ['call_itm', 'call_otm', 'put_itm', 'put_otm']):
+            st.warning("Top strikes data not available")
+            return
+        
+        st.markdown("### Top ITM/OTM Strike Prices")
+        cols = st.columns(4)
+        
+        # Call ITM
+        with cols[0]:
+            st.markdown("**Top ITM Call Strikes**")
+            if not top_strikes['call_itm'].empty:
+                for _, row in top_strikes['call_itm'].iterrows():
+                    st.markdown(f"""
+                        <div class='strike-card'>
+                            <b>{row.get('strike', 'N/A'):.0f}</b> (LTP: {row.get('call_ltp', 'N/A'):.2f})<br>
+                            OI: {row.get('call_oi', 'N/A'):,} (Δ: {row.get('call_oi_change', 'N/A'):,})<br>
+                            IV: {row.get('call_iv', 'N/A'):.1f}%
+                        </div>
+                    """, unsafe_allow_html=True)
+            else:
+                st.info("No ITM calls available")
+        
+        # Call OTM
+        with cols[1]:
+            st.markdown("**Top OTM Call Strikes**")
+            if not top_strikes['call_otm'].empty:
+                for _, row in top_strikes['call_otm'].iterrows():
+                    st.markdown(f"""
+                        <div class='strike-card'>
+                            <b>{row.get('strike', 'N/A'):.0f}</b> (LTP: {row.get('call_ltp', 'N/A'):.2f})<br>
+                            OI: {row.get('call_oi', 'N/A'):,} (Δ: {row.get('call_oi_change', 'N/A'):,})<br>
+                            IV: {row.get('call_iv', 'N/A'):.1f}%
+                        </div>
+                    """, unsafe_allow_html=True)
+            else:
+                st.info("No OTM calls available")
+        
+        # Put ITM
+        with cols[2]:
+            st.markdown("**Top ITM Put Strikes**")
+            if not top_strikes['put_itm'].empty:
+                for _, row in top_strikes['put_itm'].iterrows():
+                    st.markdown(f"""
+                        <div class='strike-card'>
+                            <b>{row.get('strike', 'N/A'):.0f}</b> (LTP: {row.get('put_ltp', 'N/A'):.2f})<br>
+                            OI: {row.get('put_oi', 'N/A'):,} (Δ: {row.get('put_oi_change', 'N/A'):,})<br>
+                            IV: {row.get('put_iv', 'N/A'):.1f}%
+                        </div>
+                    """, unsafe_allow_html=True)
+            else:
+                st.info("No ITM puts available")
+        
+        # Put OTM
+        with cols[3]:
+            st.markdown("**Top OTM Put Strikes**")
+            if not top_strikes['put_otm'].empty:
+                for _, row in top_strikes['put_otm'].iterrows():
+                    st.markdown(f"""
+                        <div class='strike-card'>
+                            <b>{row.get('strike', 'N/A'):.0f}</b> (LTP: {row.get('put_ltp', 'N/A'):.2f})<br>
+                            OI: {row.get('put_oi', 'N/A'):,} (Δ: {row.get('put_oi_change', 'N/A'):,})<br>
+                            IV: {row.get('put_iv', 'N/A'):.1f}%
+                        </div>
+                    """, unsafe_allow_html=True)
+            else:
+                st.info("No OTM puts available")
+                
+    except Exception as e:
+        st.error(f"Error displaying top strikes: {str(e)}")
+
+def main():
+    st.markdown("<div class='header'><h1>📊 Upstox Options Chain Dashboard</h1></div>", unsafe_allow_html=True)
+    
+    # Fetch spot price
+    spot_price = fetch_nifty_price()
+    if spot_price is None:
+        st.error("Failed to fetch Nifty spot price. Using default value.")
+        spot_price = 22000  # Default fallback
+    
+    # Fetch and process data
+    with st.spinner("Fetching live options data..."):
+        raw_data = fetch_options_data(asset_key, expiry_date)
+    
+    if raw_data is None:
+        st.error("Failed to load data. Please try again later.")
+        return
+    
+    df = process_options_data(raw_data, spot_price)
+    if df is None or df.empty:
+        st.error("No data available for the selected parameters.")
+        return
+    
+    # Get top strikes with validation
+    top_strikes = get_top_strikes(df, spot_price)
+    
+    # Display top strikes section
+    display_top_strikes(top_strikes)
 
 # Probability of Profit Calculator
 def calculate_probability_of_profit(row, spot_price, option_type='call'):
