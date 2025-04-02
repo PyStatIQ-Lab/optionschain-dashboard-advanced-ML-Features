@@ -289,28 +289,43 @@ def detect_arbitrage_opportunities(df, spot_price, risk_free_rate=0.05):
 def detect_smart_money_flow(df):
     smart_money = []
     
-    # Check if DataFrame is empty
-    if df.empty:
-        return smart_money
-    
-    # Calculate median call premium
     try:
+        # Check if DataFrame is empty or required columns are missing
+        if df.empty or not all(col in df.columns for col in ['call_oi_change', 'call_ltp', 'put_oi_change', 'put_ltp']):
+            return smart_money
+        
+        # Calculate median call premium safely
         median_call_premium = df['call_ltp'].median()
         
-        # Institutional Call Buying
-        high_premium_calls = df[(df['call_oi_change'] > 0) & 
-                               (df['call_ltp'] > 1.5 * median_call_premium)]
-        if not high_premium_calls.empty:
-            smart_money.append(("Institutional Call Buying", high_premium_calls['strike'].tolist()))
+        # Institutional Call Buying - look for high premium calls with OI increase
+        high_premium_calls = df[
+            (df['call_oi_change'] > 0) & 
+            (df['call_ltp'] > 1.5 * median_call_premium) &
+            (df['call_ltp'] > 0)  # Ensure valid premium
+        ]
         
-        # Put Writing
-        put_writing = df[(df['put_oi_change'] < 0) & 
-                        (df['put_ltp'] > df['put_ltp'].quantile(0.75))]
+        if not high_premium_calls.empty:
+            smart_money.append(
+                ("Institutional Call Buying", 
+                 high_premium_calls['strike'].astype(int).unique().tolist())
+            )
+        
+        # Put Writing - look for puts with decreasing OI but high premium
+        put_75_percentile = df['put_ltp'].quantile(0.75)
+        put_writing = df[
+            (df['put_oi_change'] < 0) & 
+            (df['put_ltp'] > put_75_percentile) &
+            (df['put_ltp'] > 0)  # Ensure valid premium
+        ]
+        
         if not put_writing.empty:
-            smart_money.append(("Put Writing (Bearish)", put_writing['strike'].tolist()))
-    
+            smart_money.append(
+                ("Put Writing (Bearish)", 
+                 put_writing['strike'].astype(int).unique().tolist())
+            )
+            
     except Exception as e:
-        st.warning(f"Smart money detection failed: {str(e)}")
+        st.warning(f"Smart money detection encountered an error: {str(e)}")
     
     return smart_money
 
