@@ -3,16 +3,20 @@ import requests
 import pandas as pd
 import numpy as np
 import plotly.express as px
-from datetime import datetime, timedelta
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from datetime import datetime
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
-from scipy.stats import norm
-from hmmlearn import hmm
+from hmmlearn.hmm import GaussianHMM
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
 import json
+from scipy.stats import norm
+import warnings
+warnings.filterwarnings('ignore')
 
 # Configure page
 st.set_page_config(
-    page_title="Upstox Options Chain Dashboard",
+    page_title="PyStatIQ Options Chain Dashboard",
     page_icon="📊",
     layout="wide"
 )
@@ -62,6 +66,7 @@ st.markdown("""
         margin-bottom: 10px;
         background-color: #e8f5e9;
         border-left: 5px solid #2e7d32;
+        color: #000;
     }
     .trade-recommendation.sell {
         background-color: #ffebee;
@@ -71,28 +76,36 @@ st.markdown("""
         padding: 10px;
         border-radius: 5px;
         margin-bottom: 10px;
-        background-color: #f5f5f5;
+        background-color: #40404f;
     }
     .regime-low {
         background-color: #e8f5e9;
-        padding: 10px;
-        border-radius: 5px;
+        border-left: 5px solid #2e7d32;
     }
     .regime-normal {
-        background-color: #fff8e1;
-        padding: 10px;
-        border-radius: 5px;
+        background-color: #fff3e0;
+        border-left: 5px solid #fb8c00;
     }
     .regime-high {
         background-color: #ffebee;
-        padding: 10px;
-        border-radius: 5px;
+        border-left: 5px solid #c62828;
     }
-    .smart-money {
+    .ml-signal {
+        font-weight: bold;
+        padding: 3px 6px;
+        border-radius: 4px;
+    }
+    .signal-buy {
+        background-color: #e8f5e9;
+        color: #2e7d32;
+    }
+    .signal-sell {
+        background-color: #ffebee;
+        color: #c62828;
+    }
+    .signal-neutral {
         background-color: #e3f2fd;
-        padding: 10px;
-        border-radius: 5px;
-        margin-bottom: 10px;
+        color: #1565c0;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -105,7 +118,11 @@ HEADERS = {
     "content-type": "application/json"
 }
 
-# Fetch data from Upstox API
+# Constants
+RISK_FREE_RATE = 0.05  # 5% risk-free rate for calculations
+DAYS_IN_YEAR = 365
+
+# Fetch data from API
 @st.cache_data(ttl=300)
 def fetch_options_data(asset_key="NSE_INDEX|Nifty 50", expiry="03-04-2025"):
     url = f"{BASE_URL}/strategy-chains?assetKey={asset_key}&strategyChainType=PC_CHAIN&expiry={expiry}"
@@ -193,425 +210,279 @@ def process_options_data(raw_data, spot_price):
 
 # Get top ITM/OTM strikes
 def get_top_strikes(df, spot_price, n=5):
-    """Safely get top ITM/OTM strikes with proper error handling"""
-    result = {
-        'call_itm': pd.DataFrame(),
-        'call_otm': pd.DataFrame(),
-        'put_itm': pd.DataFrame(),
-        'put_otm': pd.DataFrame()
+    call_itm = df[df['strike'] < spot_price].sort_values('strike', ascending=False).head(n)
+    call_otm = df[df['strike'] > spot_price].sort_values('strike', ascending=True).head(n)
+    put_itm = df[df['strike'] > spot_price].sort_values('strike', ascending=True).head(n)
+    put_otm = df[df['strike'] < spot_price].sort_values('strike', ascending=False).head(n)
+    
+    return {
+        'call_itm': call_itm,
+        'call_otm': call_otm,
+        'put_itm': put_itm,
+        'put_otm': put_otm
     }
-    
-    try:
-        if df is not None and not df.empty:
-            # Filter and sort calls
-            if 'strike' in df.columns and 'call_ltp' in df.columns:
-                result['call_itm'] = df[df['strike'] < spot_price].sort_values('strike', ascending=False).head(n)
-                result['call_otm'] = df[df['strike'] > spot_price].sort_values('strike', ascending=True).head(n)
-            
-            # Filter and sort puts
-            if 'strike' in df.columns and 'put_ltp' in df.columns:
-                result['put_itm'] = df[df['strike'] > spot_price].sort_values('strike', ascending=True).head(n)
-                result['put_otm'] = df[df['strike'] < spot_price].sort_values('strike', ascending=False).head(n)
-                
-    except Exception as e:
-        st.error(f"Error processing top strikes: {str(e)}")
-    
-    return result
 
-def display_top_strikes(top_strikes):
-    """Safely display the top strikes section with validation"""
-    try:
-        if not top_strikes or any(key not in top_strikes for key in ['call_itm', 'call_otm', 'put_itm', 'put_otm']):
-            st.warning("Top strikes data not available")
-            return
+# Machine Learning Model for Trade Signals
+class OptionTradeModel:
+    def __init__(self):
+        self.model = GradientBoostingClassifier(n_estimators=100, learning_rate=0.1, max_depth=3, random_state=42)
+        self.scaler = StandardScaler()
+        self.trained = False
         
-        st.markdown("### Top ITM/OTM Strike Prices")
-        cols = st.columns(4)
+    def prepare_features(self, df, spot_price):
+        features = []
+        for _, row in df.iterrows():
+            features.append([
+                row['call_iv'] - row['put_iv'],  # IV Skew
+                row['call_oi_change'],
+                row['put_oi_change'],
+                (row['call_ask'] - row['call_bid']) / row['call_ltp'] if row['call_ltp'] > 0 else 0,  # Call spread %
+                (row['put_ask'] - row['put_bid']) / row['put_ltp'] if row['put_ltp'] > 0 else 0,  # Put spread %
+                row['call_volume'] / (df['call_volume'].max() + 1e-6),  # Normalized volume
+                row['put_volume'] / (df['put_volume'].max() + 1e-6),
+                (spot_price - row['strike']) / spot_price if row['call_moneyness'] == 'OTM' else 0,  % OTM for calls
+                (row['strike'] - spot_price) / spot_price if row['put_moneyness'] == 'OTM' else 0,  % OTM for puts
+                row['call_gamma'],
+                row['put_gamma']
+            ])
+        return np.array(features)
+    
+    def train(self, X, y):
+        X_scaled = self.scaler.fit_transform(X)
+        self.model.fit(X_scaled, y)
+        self.trained = True
         
-        # Call ITM
-        with cols[0]:
-            st.markdown("**Top ITM Call Strikes**")
-            if not top_strikes['call_itm'].empty:
-                for _, row in top_strikes['call_itm'].iterrows():
-                    st.markdown(f"""
-                        <div class='strike-card'>
-                            <b>{row.get('strike', 'N/A'):.0f}</b> (LTP: {row.get('call_ltp', 'N/A'):.2f})<br>
-                            OI: {row.get('call_oi', 'N/A'):,} (Δ: {row.get('call_oi_change', 'N/A'):,})<br>
-                            IV: {row.get('call_iv', 'N/A'):.1f}%
-                        </div>
-                    """, unsafe_allow_html=True)
-            else:
-                st.info("No ITM calls available")
-        
-        # Call OTM
-        with cols[1]:
-            st.markdown("**Top OTM Call Strikes**")
-            if not top_strikes['call_otm'].empty:
-                for _, row in top_strikes['call_otm'].iterrows():
-                    st.markdown(f"""
-                        <div class='strike-card'>
-                            <b>{row.get('strike', 'N/A'):.0f}</b> (LTP: {row.get('call_ltp', 'N/A'):.2f})<br>
-                            OI: {row.get('call_oi', 'N/A'):,} (Δ: {row.get('call_oi_change', 'N/A'):,})<br>
-                            IV: {row.get('call_iv', 'N/A'):.1f}%
-                        </div>
-                    """, unsafe_allow_html=True)
-            else:
-                st.info("No OTM calls available")
-        
-        # Put ITM
-        with cols[2]:
-            st.markdown("**Top ITM Put Strikes**")
-            if not top_strikes['put_itm'].empty:
-                for _, row in top_strikes['put_itm'].iterrows():
-                    st.markdown(f"""
-                        <div class='strike-card'>
-                            <b>{row.get('strike', 'N/A'):.0f}</b> (LTP: {row.get('put_ltp', 'N/A'):.2f})<br>
-                            OI: {row.get('put_oi', 'N/A'):,} (Δ: {row.get('put_oi_change', 'N/A'):,})<br>
-                            IV: {row.get('put_iv', 'N/A'):.1f}%
-                        </div>
-                    """, unsafe_allow_html=True)
-            else:
-                st.info("No ITM puts available")
-        
-        # Put OTM
-        with cols[3]:
-            st.markdown("**Top OTM Put Strikes**")
-            if not top_strikes['put_otm'].empty:
-                for _, row in top_strikes['put_otm'].iterrows():
-                    st.markdown(f"""
-                        <div class='strike-card'>
-                            <b>{row.get('strike', 'N/A'):.0f}</b> (LTP: {row.get('put_ltp', 'N/A'):.2f})<br>
-                            OI: {row.get('put_oi', 'N/A'):,} (Δ: {row.get('put_oi_change', 'N/A'):,})<br>
-                            IV: {row.get('put_iv', 'N/A'):.1f}%
-                        </div>
-                    """, unsafe_allow_html=True)
-            else:
-                st.info("No OTM puts available")
-                
-    except Exception as e:
-        st.error(f"Error displaying top strikes: {str(e)}")
+    def predict(self, X):
+        if not self.trained:
+            return np.zeros(X.shape[0])
+        X_scaled = self.scaler.transform(X)
+        return self.model.predict_proba(X_scaled)[:, 1]  # Probability of being a good buy
+    
+    def feature_importance(self):
+        if not self.trained:
+            return None
+        return self.model.feature_importances_
 
-def main():
-    st.markdown("<div class='header'><h1>📊 Upstox Options Chain Dashboard</h1></div>", unsafe_allow_html=True)
+# Market Regime Detection using HMM
+class MarketRegimeDetector:
+    def __init__(self, n_states=3):
+        self.model = GaussianHMM(n_components=n_states, covariance_type="diag", n_iter=1000, random_state=42)
+        self.regime_map = {0: "Low Volatility", 1: "Normal", 2: "High Volatility"}
+        
+    def fit(self, historical_data):
+        # historical_data should be a DataFrame with columns: ['iv', 'volume', 'returns']
+        self.model.fit(historical_data[['iv', 'volume', 'returns']].values.reshape(-1, 3))
+        
+    def predict_regime(self, current_data):
+        # current_data should be a dict with: {'iv': x, 'volume': y, 'returns': z}
+        regime = self.model.predict(np.array([[current_data['iv'], current_data['volume'], current_data['returns']]]))
+        return self.regime_map[regime[0]]
     
-    # Fetch spot price
-    spot_price = fetch_nifty_price()
-    if spot_price is None:
-        st.error("Failed to fetch Nifty spot price. Using default value.")
-        spot_price = 22000  # Default fallback
+    def get_expected_move(self, current_iv, days_to_expiry):
+        # Calculate expected move based on IV
+        return current_iv * np.sqrt(days_to_expiry / DAYS_IN_YEAR)
+
+# Arbitrage Detection
+def detect_arbitrage_opportunities(df, spot_price, risk_free_rate, days_to_expiry):
+    arbitrage_ops = []
+    for _, row in df.iterrows():
+        strike = row['strike']
+        call_price = row['call_ltp']
+        put_price = row['put_ltp']
+        
+        # Put-call parity: C - P = S - K*e^(-rT)
+        theoretical_diff = spot_price - strike * np.exp(-risk_free_rate * days_to_expiry / DAYS_IN_YEAR)
+        actual_diff = call_price - put_price
+        
+        # Arbitrage opportunities
+        if abs(actual_diff - theoretical_diff) > max(5, 0.05 * spot_price):  # Threshold
+            arbitrage_ops.append({
+                'strike': strike,
+                'call_price': call_price,
+                'put_price': put_price,
+                'theoretical_diff': theoretical_diff,
+                'actual_diff': actual_diff,
+                'arbitrage_amount': abs(actual_diff - theoretical_diff),
+                'direction': 'Buy Put + Sell Call' if actual_diff > theoretical_diff else 'Buy Call + Sell Put'
+            })
     
-    # Fetch and process data
-    with st.spinner("Fetching live options data..."):
-        raw_data = fetch_options_data(asset_key, expiry_date)
-    
-    if raw_data is None:
-        st.error("Failed to load data. Please try again later.")
-        return
-    
-    df = process_options_data(raw_data, spot_price)
-    if df is None or df.empty:
-        st.error("No data available for the selected parameters.")
-        return
-    
-    # Get top strikes with validation
-    top_strikes = get_top_strikes(df, spot_price)
-    
-    # Display top strikes section
-    display_top_strikes(top_strikes)
+    return pd.DataFrame(arbitrage_ops).sort_values('arbitrage_amount', ascending=False)
 
 # Probability of Profit Calculator
-def calculate_probability_of_profit(row, spot_price, option_type='call'):
-    strike = row['strike']
-    premium = row['call_ltp'] if option_type == 'call' else row['put_ltp']
-    iv = row['call_iv'] if option_type == 'call' else row['put_iv']
-    days_to_expiry = 7  # Example
-    
+def calculate_probability_of_profit(option_type, strike, premium, spot_price, iv, days_to_expiry):
     if option_type == 'call':
         break_even = strike + premium
-        pop = 1 - norm.cdf(np.log(break_even/spot_price) / (iv * np.sqrt(days_to_expiry/365)))
-    else:
+        expected_move = spot_price * iv * np.sqrt(days_to_expiry / DAYS_IN_YEAR)
+        z_score = (break_even - spot_price) / (spot_price * iv * np.sqrt(days_to_expiry / DAYS_IN_YEAR))
+    else:  # put
         break_even = strike - premium
-        pop = norm.cdf(np.log(break_even/spot_price) / (iv * np.sqrt(days_to_expiry/365)))
+        expected_move = spot_price * iv * np.sqrt(days_to_expiry / DAYS_IN_YEAR)
+        z_score = (spot_price - break_even) / (spot_price * iv * np.sqrt(days_to_expiry / DAYS_IN_YEAR))
     
-    return pop * 100
+    return 1 - norm.cdf(z_score)
 
-# Expected Move Calculation
-def calculate_expected_move(spot_price, iv, days_to_expiry=7):
-    return spot_price * iv * np.sqrt(days_to_expiry/365)
-
-# Greeks-Based Alerts
-def generate_greeks_alerts(row):
-    alerts = []
-    
-    if abs(row['call_gamma']) > 0.08:
-        alerts.append(("High Gamma", "Potential for gamma scalping"))
-    if row['call_theta'] < -0.05:
-        alerts.append(("High Theta", "Rapid time decay - caution selling"))
-    if abs(row['call_vega']) > 0.15:
-        alerts.append(("High Vega", "Highly sensitive to volatility changes"))
-    
-    return alerts
-
-# Market Regime Detection
-def detect_market_regime(historical_iv):
-    try:
-        # Remove NaN values and ensure we have enough data
-        historical_iv = historical_iv[~np.isnan(historical_iv)]
-        if len(historical_iv) < 10:
-            return 1  # Return "Normal" regime if not enough data
-        
-        # Convert to daily changes
-        returns = np.diff(np.log(historical_iv))
-        
-        # Remove any infinite values
-        returns = returns[np.isfinite(returns)]
-        
-        if len(returns) < 2:
-            return 1  # Return "Normal" regime if not enough data
-            
-        # Fit HMM model
-        model = hmm.GaussianHMM(n_components=3, covariance_type="diag")
-        model.fit(returns.reshape(-1,1))
-        
-        # Predict regimes
-        regimes = model.predict(returns.reshape(-1,1))
-        
-        return regimes[-1]
-    except Exception as e:
-        st.warning(f"Market regime detection failed: {str(e)}")
-        return 1
-
-# Put-Call Parity Arbitrage Detection
-def detect_arbitrage_opportunities(df, spot_price, risk_free_rate=0.05):
-    arbitrage_ops = []
-    
-    for _, row in df.iterrows():
-        synthetic_put = row['call_ltp'] - spot_price + row['strike'] * np.exp(-risk_free_rate * (7/365))
-        actual_put = row['put_ltp']
-        
-        if abs(synthetic_put - actual_put) > (0.05 * actual_put):
-            direction = "Buy Put + Sell Synthetic" if synthetic_put > actual_put else "Buy Synthetic + Sell Put"
-            arbitrage_ops.append({
-                'strike': row['strike'],
-                'premium_diff': synthetic_put - actual_put,
-                'direction': direction
-            })
-    
-    return sorted(arbitrage_ops, key=lambda x: abs(x['premium_diff']), reverse=True)
-
-# Smart Money Flow Identification - FIXED VERSION
-def detect_smart_money_flow(df):
+# Smart Money Flow Detection
+def detect_smart_money_flows(df, spot_price, volume_threshold, oi_change_threshold):
     smart_money = []
     
-    try:
-        # Check if DataFrame is empty or required columns are missing
-        if df.empty or not all(col in df.columns for col in ['call_oi_change', 'call_ltp', 'put_oi_change', 'put_ltp']):
-            return smart_money
+    # Criteria for institutional activity
+    for _, row in df.iterrows():
+        # Call side smart money detection
+        if (row['call_volume'] > volume_threshold and 
+            row['call_oi_change'] > oi_change_threshold and 
+            row['call_iv'] < df['call_iv'].median()):
+            smart_money.append({
+                'strike': row['strike'],
+                'side': 'Call',
+                'volume': row['call_volume'],
+                'oi_change': row['call_oi_change'],
+                'iv': row['call_iv'],
+                'signal': 'Institutional Buying' if row['call_ltp'] > (row['call_bid'] + row['call_ask']) / 2 else 'Institutional Selling'
+            })
         
-        # Calculate median call premium safely
-        median_call_premium = df['call_ltp'].median()
-        
-        # Institutional Call Buying - look for high premium calls with OI increase
-        high_premium_calls = df[
-            (df['call_oi_change'] > 0) & 
-            (df['call_ltp'] > 1.5 * median_call_premium) &
-            (df['call_ltp'] > 0)  # Ensure valid premium
-        ]
-        
-        if not high_premium_calls.empty:
-            smart_money.append(
-                ("Institutional Call Buying", 
-                 high_premium_calls['strike'].astype(int).unique().tolist())
-            )
-        
-        # Put Writing - look for puts with decreasing OI but high premium
-        put_75_percentile = df['put_ltp'].quantile(0.75)
-        put_writing = df[
-            (df['put_oi_change'] < 0) & 
-            (df['put_ltp'] > put_75_percentile) &
-            (df['put_ltp'] > 0)  # Ensure valid premium
-        ]
-        
-        if not put_writing.empty:
-            smart_money.append(
-                ("Put Writing (Bearish)", 
-                 put_writing['strike'].astype(int).unique().tolist())
-            )
-            
-    except Exception as e:
-        st.warning(f"Smart money detection encountered an error: {str(e)}")
+        # Put side smart money detection
+        if (row['put_volume'] > volume_threshold and 
+            row['put_oi_change'] > oi_change_threshold and 
+            row['put_iv'] < df['put_iv'].median()):
+            smart_money.append({
+                'strike': row['strike'],
+                'side': 'Put',
+                'volume': row['put_volume'],
+                'oi_change': row['put_oi_change'],
+                'iv': row['put_iv'],
+                'signal': 'Institutional Buying' if row['put_ltp'] > (row['put_bid'] + row['put_ask']) / 2 else 'Institutional Selling'
+            })
     
-    return smart_money
+    return pd.DataFrame(smart_money).sort_values(['volume', 'oi_change'], ascending=False)
 
-# Machine Learning Trade Signals
-def generate_ml_trade_signals(df, spot_price):
-    try:
-        # Feature engineering
-        df['distance_from_spot'] = (df['strike'] - spot_price) / spot_price
-        df['iv_skew'] = df['call_iv'] - df['put_iv']
-        df['premium_ratio'] = (df['call_ask'] - df['call_bid']) / df['call_ltp'].replace(0, 0.01)  # Handle division by zero
-        
-        # Create labels (1 = good buy, 0 = avoid)
-        conditions = [
-            (df['call_oi_change'] > df['call_oi_change'].quantile(0.75)) &
-            (df['premium_ratio'] < 0.1) &
-            (df['call_iv'] < df['call_iv'].quantile(0.75)),
-            
-            (df['put_oi_change'] > df['put_oi_change'].quantile(0.75)) &
-            (df['premium_ratio'] < 0.1) &
-            (df['put_iv'] < df['put_iv'].quantile(0.75))
-        ]
-        choices = [1, 1]
-        df['target'] = np.select(conditions, choices, default=0)
-        
-        # Train model
-        features = ['distance_from_spot', 'iv_skew', 'premium_ratio', 
-                   'call_oi_change', 'put_oi_change', 'call_iv', 'put_iv']
-        X = df[features].fillna(0)
-        y = df['target']
-        
-        if len(X) > 0 and len(y) > 0:
-            model = GradientBoostingClassifier()
-            model.fit(X, y)
-            
-            # Generate predictions
-            df['ml_score'] = model.predict_proba(X)[:,1]
-            
-            return df.sort_values('ml_score', ascending=False)
-    
-    except Exception as e:
-        st.error(f"ML signal generation failed: {str(e)}")
-        return df
-    
-    return df
-
-# Generate trade recommendations
-def generate_trade_recommendations(df, spot_price):
+# Generate trade recommendations with ML signals
+def generate_trade_recommendations(df, spot_price, model, days_to_expiry=1):
     recommendations = []
     
-    try:
-        # Calculate metrics for all strikes
-        df['call_premium_ratio'] = (df['call_ask'] - df['call_bid']) / df['call_ltp'].replace(0, 0.01)
-        df['put_premium_ratio'] = (df['put_ask'] - df['put_bid']) / df['put_ltp'].replace(0, 0.01)
-        df['call_risk_reward'] = (spot_price - df['strike'] + df['call_ltp']) / df['call_ltp'].replace(0, 0.01)
-        df['put_risk_reward'] = (df['strike'] - spot_price + df['put_ltp']) / df['put_ltp'].replace(0, 0.01)
-        
-        # Find best calls to buy
-        best_calls = df[(df['call_moneyness'] == 'OTM') & 
-                       (df['call_premium_ratio'] < 0.1) &
-                       (df['call_oi_change'] > 0)].sort_values(
-            by=['call_premium_ratio', 'call_oi_change'], 
-            ascending=[True, False]
-        ).head(3)
-        
-        for _, row in best_calls.iterrows():
-            pop = calculate_probability_of_profit(row, spot_price, 'call')
-            expected_move = calculate_expected_move(spot_price, row['call_iv'])
-            greeks_alerts = generate_greeks_alerts(row)
-            
-            recommendations.append({
-                'type': 'BUY CALL',
-                'strike': row['strike'],
-                'premium': row['call_ltp'],
-                'iv': row['call_iv'],
-                'oi_change': row['call_oi_change'],
-                'risk_reward': f"{row['call_risk_reward']:.1f}:1",
-                'probability_of_profit': f"{pop:.1f}%",
-                'expected_move': f"±{expected_move:.1f} points",
-                'greeks_alerts': greeks_alerts,
-                'reason': "Low spread, OI buildup, good risk/reward"
-            })
-        
-        # Find best puts to buy
-        best_puts = df[(df['put_moneyness'] == 'OTM') & 
-                      (df['put_premium_ratio'] < 0.1) &
-                      (df['put_oi_change'] > 0)].sort_values(
-            by=['put_premium_ratio', 'put_oi_change'], 
-            ascending=[True, False]
-        ).head(3)
-        
-        for _, row in best_puts.iterrows():
-            pop = calculate_probability_of_profit(row, spot_price, 'put')
-            expected_move = calculate_expected_move(spot_price, row['put_iv'])
-            greeks_alerts = generate_greeks_alerts(row)
-            
-            recommendations.append({
-                'type': 'BUY PUT',
-                'strike': row['strike'],
-                'premium': row['put_ltp'],
-                'iv': row['put_iv'],
-                'oi_change': row['put_oi_change'],
-                'risk_reward': f"{row['put_risk_reward']:.1f}:1",
-                'probability_of_profit': f"{pop:.1f}%",
-                'expected_move': f"±{expected_move:.1f} points",
-                'greeks_alerts': greeks_alerts,
-                'reason': "Low spread, OI buildup, good risk/reward"
-            })
-        
-        # Find best calls to sell
-        best_sell_calls = df[(df['call_moneyness'] == 'ITM') & 
-                            (df['call_premium_ratio'] > 0.15) &
-                            (df['call_oi_change'] < 0)].sort_values(
-            by=['call_premium_ratio', 'call_oi_change'], 
-            ascending=[False, True]
-        ).head(2)
-        
-        for _, row in best_sell_calls.iterrows():
-            pop = calculate_probability_of_profit(row, spot_price, 'call')
-            greeks_alerts = generate_greeks_alerts(row)
-            
-            recommendations.append({
-                'type': 'SELL CALL',
-                'strike': row['strike'],
-                'premium': row['call_ltp'],
-                'iv': row['call_iv'],
-                'oi_change': row['call_oi_change'],
-                'risk_reward': f"{1/row['call_risk_reward']:.1f}:1",
-                'probability_of_profit': f"{100-pop:.1f}%",
-                'greeks_alerts': greeks_alerts,
-                'reason': "High spread, OI unwinding, favorable risk"
-            })
-        
-        # Find best puts to sell
-        best_sell_puts = df[(df['put_moneyness'] == 'ITM') & 
-                           (df['put_premium_ratio'] > 0.15) &
-                           (df['put_oi_change'] < 0)].sort_values(
-            by=['put_premium_ratio', 'put_oi_change'], 
-            ascending=[False, True]
-        ).head(2)
-        
-        for _, row in best_sell_puts.iterrows():
-            pop = calculate_probability_of_profit(row, spot_price, 'put')
-            greeks_alerts = generate_greeks_alerts(row)
-            
-            recommendations.append({
-                'type': 'SELL PUT',
-                'strike': row['strike'],
-                'premium': row['put_ltp'],
-                'iv': row['put_iv'],
-                'oi_change': row['put_oi_change'],
-                'risk_reward': f"{1/row['put_risk_reward']:.1f}:1",
-                'probability_of_profit': f"{100-pop:.1f}%",
-                'greeks_alerts': greeks_alerts,
-                'reason': "High spread, OI unwinding, favorable risk"
-            })
+    # Prepare features for ML model
+    X = model.prepare_features(df, spot_price)
+    df['ml_score'] = model.predict(X)
     
-    except Exception as e:
-        st.error(f"Trade recommendation generation failed: {str(e)}")
+    # Get top ML-scored calls and puts
+    top_calls = df[df['call_moneyness'] == 'OTM'].sort_values('ml_score', ascending=False).head(3)
+    top_puts = df[df['put_moneyness'] == 'OTM'].sort_values('ml_score', ascending=False).head(3)
     
-    return recommendations
+    # Generate recommendations with ML signals
+    for _, row in top_calls.iterrows():
+        pop = calculate_probability_of_profit('call', row['strike'], row['call_ltp'], spot_price, row['call_iv'], days_to_expiry)
+        recommendations.append({
+            'type': 'BUY CALL',
+            'strike': row['strike'],
+            'premium': row['call_ltp'],
+            'iv': row['call_iv'],
+            'oi_change': row['call_oi_change'],
+            'ml_score': row['ml_score'],
+            'pop': pop,
+            'reason': f"ML Score: {row['ml_score']:.2f}, Prob of Profit: {pop:.1%}"
+        })
+    
+    for _, row in top_puts.iterrows():
+        pop = calculate_probability_of_profit('put', row['strike'], row['put_ltp'], spot_price, row['put_iv'], days_to_expiry)
+        recommendations.append({
+            'type': 'BUY PUT',
+            'strike': row['strike'],
+            'premium': row['put_ltp'],
+            'iv': row['put_iv'],
+            'oi_change': row['put_oi_change'],
+            'ml_score': row['ml_score'],
+            'pop': pop,
+            'reason': f"ML Score: {row['ml_score']:.2f}, Prob of Profit: {pop:.1%}"
+        })
+    
+    # Find overpriced options to sell (high IV percentile)
+    high_iv_calls = df[(df['call_moneyness'] == 'ITM') & 
+                      (df['call_iv'] > df['call_iv'].quantile(0.75))].sort_values('call_iv', ascending=False).head(2)
+    
+    for _, row in high_iv_calls.iterrows():
+        pop = calculate_probability_of_profit('call', row['strike'], row['call_ltp'], spot_price, row['call_iv'], days_to_expiry)
+        recommendations.append({
+            'type': 'SELL CALL',
+            'strike': row['strike'],
+            'premium': row['call_ltp'],
+            'iv': row['call_iv'],
+            'oi_change': row['call_oi_change'],
+            'ml_score': 1 - row['ml_score'],
+            'pop': pop,
+            'reason': f"High IV ({row['call_iv']:.1f}%), Prob of Profit: {pop:.1%}"
+        })
+    
+    high_iv_puts = df[(df['put_moneyness'] == 'ITM') & 
+                     (df['put_iv'] > df['put_iv'].quantile(0.75))].sort_values('put_iv', ascending=False).head(2)
+    
+    for _, row in high_iv_puts.iterrows():
+        pop = calculate_probability_of_profit('put', row['strike'], row['put_ltp'], spot_price, row['put_iv'], days_to_expiry)
+        recommendations.append({
+            'type': 'SELL PUT',
+            'strike': row['strike'],
+            'premium': row['put_ltp'],
+            'iv': row['put_iv'],
+            'oi_change': row['put_oi_change'],
+            'ml_score': 1 - row['ml_score'],
+            'pop': pop,
+            'reason': f"High IV ({row['put_iv']:.1f}%), Prob of Profit: {pop:.1%}"
+        })
+    
+    return recommendations, df
 
 # Main App
-# In your main() function, replace the relevant sections with this:
-
 def main():
-    st.markdown("<div class='header'><h1>📊 Upstox Options Chain Dashboard</h1></div>", unsafe_allow_html=True)
+    st.markdown("<div class='header'><h1>📊 PyStatIQ Options Chain Dashboard</h1></div>", unsafe_allow_html=True)
+    
+    # Initialize models
+    trade_model = OptionTradeModel()
+    regime_detector = MarketRegimeDetector()
+    
+    # Simulate training data (in practice, you'd use historical data)
+    X_train = np.random.rand(100, 10)  # 100 samples, 10 features
+    y_train = np.random.randint(0, 2, 100)  # Binary labels
+    trade_model.train(X_train, y_train)
+    
+    # Simulate regime detection training
+    historical_data = pd.DataFrame({
+        'iv': np.random.uniform(10, 50, 100),
+        'volume': np.random.uniform(1e6, 1e7, 100),
+        'returns': np.random.normal(0, 0.01, 100)
+    })
+    regime_detector.fit(historical_data)
     
     # Fetch spot price
     spot_price = fetch_nifty_price()
     if spot_price is None:
         st.error("Failed to fetch Nifty spot price. Using default value.")
         spot_price = 22000  # Default fallback
+    
+    # Sidebar controls
+    with st.sidebar:
+        st.header("Filters")
+        asset_key = st.selectbox(
+            "Underlying Asset",
+            ["NSE_INDEX|Nifty 50", "NSE_INDEX|Bank Nifty"],
+            index=0
+        )
+        
+        expiry_date = st.date_input(
+            "Expiry Date",
+            datetime.strptime("03-04-2025", "%d-%m-%Y")
+        ).strftime("%d-%m-%Y")
+        
+        days_to_expiry = st.number_input("Days to Expiry", min_value=1, max_value=30, value=1)
+        
+        st.markdown("---")
+        st.markdown(f"**Current Nifty Spot Price: {spot_price:,.2f}**")
+        
+        st.markdown("---")
+        st.markdown("**Analysis Settings**")
+        volume_threshold = st.number_input("High Volume Threshold", value=5000000)
+        oi_change_threshold = st.number_input("Significant OI Change", value=1000000)
+        
+        st.markdown("---")
+        st.markdown("**About**")
+        st.markdown("Advanced options analytics dashboard with ML signals, risk metrics, and smart money detection.")
     
     # Fetch and process data
     with st.spinner("Fetching live options data..."):
@@ -626,93 +497,73 @@ def main():
         st.error("No data available for the selected parameters.")
         return
     
-    # Get top strikes - ADDED VALIDATION
-    try:
-        top_strikes = get_top_strikes(df, spot_price) if df is not None else {}
+    # Get top strikes
+    top_strikes = get_top_strikes(df, spot_price)
+    
+    # Default strike selection (ATM)
+    atm_strike = df.iloc[(df['strike'] - spot_price).abs().argsort()[:1]]['strike'].values[0]
+    
+    # Market Regime Detection
+    current_volatility = df['call_iv'].mean()  # Using average call IV as proxy
+    current_volume = df['call_volume'].sum() + df['put_volume'].sum()
+    current_return = 0  # Would normally get from historical data
+    
+    regime = regime_detector.predict_regime({
+        'iv': current_volatility,
+        'volume': current_volume,
+        'returns': current_return
+    })
+    
+    expected_move_pct = regime_detector.get_expected_move(current_volatility, days_to_expiry)
+    expected_move_points = spot_price * expected_move_pct
+    
+    # Main columns
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col1:
+        st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
+        st.markdown("**Total Call OI**")
+        total_call_oi = df['call_oi'].sum()
+        st.markdown(f"<h2>{total_call_oi:,}</h2>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
         
-        # Display Top Strikes Section - ADDED VALIDATION
-        if top_strikes and all(k in top_strikes for k in ['call_itm', 'call_otm', 'put_itm', 'put_otm']):
-            st.markdown("### Top ITM/OTM Strike Prices")
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                st.markdown("**Top ITM Call Strikes**")
-                for _, row in top_strikes['call_itm'].iterrows():
-                    st.markdown(f"""
-                        <div class='strike-card'>
-                            <b>{row['strike']:.0f}</b> (LTP: {row['call_ltp']:.2f})<br>
-                            OI: {row['call_oi']:,} (Δ: {row['call_oi_change']:,})<br>
-                            IV: {row['call_iv']:.1f}%
-                        </div>
-                    """, unsafe_allow_html=True)
-            
-            with col2:
-                st.markdown("**Top OTM Call Strikes**")
-                for _, row in top_strikes['call_otm'].iterrows():
-                    st.markdown(f"""
-                        <div class='strike-card'>
-                            <b>{row['strike']:.0f}</b> (LTP: {row['call_ltp']:.2f})<br>
-                            OI: {row['call_oi']:,} (Δ: {row['call_oi_change']:,})<br>
-                            IV: {row['call_iv']:.1f}%
-                        </div>
-                    """, unsafe_allow_html=True)
-            
-            with col3:
-                st.markdown("**Top ITM Put Strikes**")
-                for _, row in top_strikes['put_itm'].iterrows():
-                    st.markdown(f"""
-                        <div class='strike-card'>
-                            <b>{row['strike']:.0f}</b> (LTP: {row['put_ltp']:.2f})<br>
-                            OI: {row['put_oi']:,} (Δ: {row['put_oi_change']:,})<br>
-                            IV: {row['put_iv']:.1f}%
-                        </div>
-                    """, unsafe_allow_html=True)
-            
-            with col4:
-                st.markdown("**Top OTM Put Strikes**")
-                for _, row in top_strikes['put_otm'].iterrows():
-                    st.markdown(f"""
-                        <div class='strike-card'>
-                            <b>{row['strike']:.0f}</b> (LTP: {row['put_ltp']:.2f})<br>
-                            OI: {row['put_oi']:,} (Δ: {row['put_oi_change']:,})<br>
-                            IV: {row['put_iv']:.1f}%
-                        </div>
-                    """, unsafe_allow_html=True)
-        else:
-            st.warning("Could not load top strikes data")
-    except Exception as e:
-        st.error(f"Error displaying top strikes: {str(e)}")
+        st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
+        st.markdown("**Total Put OI**")
+        total_put_oi = df['put_oi'].sum()
+        st.markdown(f"<h2>{total_put_oi:,}</h2>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
     
-    # Smart Money Flow Section - ADDED VALIDATION
-    try:
-        if df is not None:
-            smart_money = detect_smart_money_flow(df)
-            if smart_money:
-                st.markdown("### Smart Money Flow")
-                for flow in smart_money:
-                    if flow and len(flow) == 2 and flow[1]:  # Check if valid flow data
-                        st.markdown(f"""
-                            <div class='smart-money'>
-                                <b>{flow[0]}</b> detected at strikes: {', '.join(map(str, flow[1]))}
-                            </div>
-                        """, unsafe_allow_html=True)
-    except Exception as e:
-        st.error(f"Could not analyze smart money flow: {str(e)}")
+    with col2:
+        # Strike price selector
+        selected_strike = st.selectbox(
+            "Select Strike Price",
+            df['strike'].unique(),
+            index=int(np.where(df['strike'].unique() == atm_strike)[0][0])
+        )
+        
+        # Market regime display
+        regime_class = "regime-low" if "Low" in regime else ("regime-high" if "High" in regime else "regime-normal")
+        st.markdown(f"""
+            <div class='metric-card {regime_class}'>
+                <h3>Market Regime: {regime}</h3>
+                <p>Expected Move: ±{expected_move_pct:.2%} (±{expected_move_points:.0f} points)</p>
+            </div>
+        """, unsafe_allow_html=True)
     
-    # Smart Money Flow
-try:
-    smart_money = detect_smart_money_flow(df)
-    if smart_money:
-        st.markdown("### Smart Money Flow")
-        for flow in smart_money:
-            if flow[1]:  # Check if strike list is not empty
-                st.markdown(f"""
-                    <div class='smart-money'>
-                        <b>{flow[0]}</b> detected at strikes: {', '.join(map(str, flow[1]))}
-                    </div>
-                """, unsafe_allow_html=True)
-except Exception as e:
-    st.warning(f"Could not analyze smart money flow: {str(e)}")
+    with col3:
+        st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
+        st.markdown("**Call OI Change**")
+        call_oi_change = df[df['strike'] == selected_strike]['call_oi_change'].values[0]
+        change_color = "positive" if call_oi_change > 0 else "negative"
+        st.markdown(f"<h2 class='{change_color}'>{call_oi_change:,}</h2>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+        
+        st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
+        st.markdown("**Put OI Change**")
+        put_oi_change = df[df['strike'] == selected_strike]['put_oi_change'].values[0]
+        change_color = "positive" if put_oi_change > 0 else "negative"
+        st.markdown(f"<h2 class='{change_color}'>{put_oi_change:,}</h2>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
     
     # Top Strikes Section
     st.markdown("### Top ITM/OTM Strike Prices")
@@ -762,21 +613,23 @@ except Exception as e:
                 </div>
             """, unsafe_allow_html=True)
     
-    # Trade Recommendations
-    st.markdown("### Trade Recommendations")
-    recommendations = generate_trade_recommendations(df, spot_price)
+    # Trade Recommendations with ML
+    st.markdown("### AI-Powered Trade Recommendations")
+    recommendations, df_with_scores = generate_trade_recommendations(df, spot_price, trade_model, days_to_expiry)
     
     if recommendations:
         for rec in recommendations:
             is_sell = 'SELL' in rec['type']
+            ml_score_class = "signal-buy" if rec['ml_score'] > 0.7 else ("signal-sell" if rec['ml_score'] < 0.3 else "signal-neutral")
+            
             st.markdown(f"""
                 <div class='trade-recommendation{' sell' if is_sell else ''}'>
-                    <h4>{rec['type']} @ {rec['strike']:.0f}</h4>
+                    <h4>{rec['type']} @ {rec['strike']:.0f} 
+                        <span class='ml-signal {ml_score_class}'>ML Score: {rec['ml_score']:.2f}</span>
+                        <span style='float:right;'>Prob Profit: {rec['pop']:.1%}</span>
+                    </h4>
                     <p>
-                        Premium: {rec['premium']:.2f} | IV: {rec['iv']:.1f}%<br>
-                        OI Change: {rec['oi_change']:,} | Risk/Reward: {rec['risk_reward']}<br>
-                        Probability of Profit: {rec['probability_of_profit']} | Expected Move: {rec['expected_move']}<br>
-                        {''.join([f"<b>Alert:</b> {alert[0]} - {alert[1]}<br>" for alert in rec.get('greeks_alerts', [])])}
+                        Premium: {rec['premium']:.2f} | IV: {rec['iv']:.1f}% | OI Change: {rec['oi_change']:,}<br>
                         <b>Reason:</b> {rec['reason']}
                     </p>
                 </div>
@@ -785,7 +638,7 @@ except Exception as e:
         st.info("No strong trade recommendations based on current market conditions")
     
     # Tab layout
-    tab1, tab2, tab3 = st.tabs(["Strike Analysis", "Advanced Analytics", "Predictive Models"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Strike Analysis", "OI/Volume Trends", "Advanced Analytics", "Predictive Models"])
     
     with tab1:
         st.markdown(f"### Detailed Analysis for Strike: {selected_strike}")
@@ -834,64 +687,196 @@ except Exception as e:
         )
     
     with tab2:
-        st.markdown("### Advanced Analytics")
+        st.markdown("### Open Interest & Volume Trends")
         
-        # IV Skew Analysis
-        st.markdown("#### IV Skew Analysis")
-        fig = px.line(
-            df,
+        # Nearby strikes
+        all_strikes = sorted(df['strike'].unique())
+        current_idx = all_strikes.index(selected_strike)
+        nearby_strikes = all_strikes[max(0, current_idx-5):min(len(all_strikes), current_idx+6)]
+        nearby_df = df[df['strike'].isin(nearby_strikes)]
+        
+        # OI Change plot
+        fig = px.bar(
+            nearby_df,
             x='strike',
-            y=['call_iv', 'put_iv'],
-            title='Implied Volatility Skew',
-            labels={'value': 'IV (%)', 'strike': 'Strike Price'},
-            color_discrete_map={'call_iv': '#3498db', 'put_iv': '#e74c3c'}
+            y=['call_oi_change', 'put_oi_change'],
+            barmode='group',
+            title=f'OI Changes Around {selected_strike}',
+            labels={'value': 'OI Change', 'strike': 'Strike Price'},
+            color_discrete_map={'call_oi_change': '#3498db', 'put_oi_change': '#e74c3c'}
         )
-        fig.add_vline(x=spot_price, line_dash="dash", line_color="gray")
         st.plotly_chart(fig, use_container_width=True)
         
-        # Greeks Monitoring
-        st.markdown("#### Greeks Monitoring")
-        greeks_cols = st.columns(3)
-        with greeks_cols[0]:
-            st.plotly_chart(px.line(df, x='strike', y='call_gamma', title='Call Gamma Exposure'))
-        with greeks_cols[1]:
-            st.plotly_chart(px.line(df, x='strike', y='call_theta', title='Call Theta Decay'))
-        with greeks_cols[2]:
-            st.plotly_chart(px.line(df, x='strike', y='call_vega', title='Call Vega Sensitivity'))
-        
-        # Arbitrage Opportunities
-        st.markdown("#### Arbitrage Opportunities")
-        arbitrage_ops = detect_arbitrage_opportunities(df, spot_price)
-        if arbitrage_ops:
-            for op in arbitrage_ops[:3]:
-                st.warning(f"Strike {op['strike']}: {op['direction']} (Premium Diff: {op['premium_diff']:.2f})")
-        else:
-            st.info("No arbitrage opportunities detected")
+        # Volume plot
+        fig = px.bar(
+            nearby_df,
+            x='strike',
+            y=['call_volume', 'put_volume'],
+            barmode='group',
+            title=f'Volume Around {selected_strike}',
+            labels={'value': 'Volume', 'strike': 'Strike Price'},
+            color_discrete_map={'call_volume': '#3498db', 'put_volume': '#e74c3c'}
+        )
+        st.plotly_chart(fig, use_container_width=True)
     
     with tab3:
-        st.markdown("### Predictive Models")
+        st.markdown("### Advanced Analytics")
         
-        # Machine Learning Trade Signals
-        st.markdown("#### Machine Learning Trade Signals")
-        ml_signals = generate_ml_trade_signals(df.copy(), spot_price)
-        st.dataframe(
-            ml_signals[['strike', 'ml_score', 'call_oi_change', 'put_oi_change', 'call_iv', 'put_iv']].head(10).style.background_gradient(subset=['ml_score'], cmap='RdYlGn'),
-            use_container_width=True
-        )
+        col1, col2 = st.columns(2)
         
-        # Probability Distribution
-        st.markdown("#### Probability Distribution")
-        strike_range = np.linspace(spot_price * 0.9, spot_price * 1.1, 20)
-        prob_up = [calculate_probability_of_profit(df.iloc[(df['strike'] - s).abs().argsort()[:1].iloc[0]], spot_price, 'call') for s in strike_range]
-        prob_down = [calculate_probability_of_profit(df.iloc[(df['strike'] - s).abs().argsort()[:1].iloc[0]], spot_price, 'put') for s in strike_range]
+        with col1:
+            # Arbitrage Opportunities
+            st.markdown("#### Arbitrage Opportunities")
+            arbitrage_ops = detect_arbitrage_opportunities(df, spot_price, RISK_FREE_RATE, days_to_expiry)
+            
+            if not arbitrage_ops.empty:
+                st.dataframe(
+                    arbitrage_ops.style.format({
+                        'call_price': '{:.2f}',
+                        'put_price': '{:.2f}',
+                        'theoretical_diff': '{:.2f}',
+                        'actual_diff': '{:.2f}',
+                        'arbitrage_amount': '{:.2f}'
+                    }),
+                    use_container_width=True
+                )
+            else:
+                st.info("No significant arbitrage opportunities detected")
+            
+            # Smart Money Flows
+            st.markdown("#### Smart Money Flow Detection")
+            smart_money = detect_smart_money_flows(df, spot_price, volume_threshold, oi_change_threshold)
+            
+            if not smart_money.empty:
+                st.dataframe(
+                    smart_money.style.format({
+                        'volume': '{:,}',
+                        'oi_change': '{:,}',
+                        'iv': '{:.1f}%'
+                    }),
+                    use_container_width=True
+                )
+            else:
+                st.info("No unusual smart money activity detected")
         
-        fig = px.line(x=strike_range, y=[prob_up, prob_down], 
-                     labels={'x': 'Strike Price', 'value': 'Probability (%)'},
-                     title='Probability of Profit Across Strikes')
-        fig.update_traces(line_color='green', selector={'name': '0'})
-        fig.update_traces(line_color='red', selector={'name': '1'})
-        fig.add_vline(x=spot_price, line_dash="dash", line_color="gray")
-        st.plotly_chart(fig, use_container_width=True)
+        with col2:
+            # IV Skew Analysis
+            st.markdown("#### IV Skew Analysis")
+            fig = px.line(
+                df,
+                x='strike',
+                y=['call_iv', 'put_iv'],
+                title='Implied Volatility Skew',
+                labels={'value': 'IV (%)', 'strike': 'Strike Price'},
+                color_discrete_map={'call_iv': '#3498db', 'put_iv': '#e74c3c'}
+            )
+            fig.add_vline(x=spot_price, line_dash="dash", line_color="gray")
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Greeks Exposure
+            st.markdown("#### Greeks Exposure")
+            fig = px.line(
+                df,
+                x='strike',
+                y=['call_gamma', 'put_gamma', 'call_theta', 'put_theta'],
+                title='Gamma and Theta Exposure',
+                labels={'value': 'Value', 'strike': 'Strike Price'},
+                color_discrete_map={
+                    'call_gamma': '#3498db', 
+                    'put_gamma': '#e74c3c',
+                    'call_theta': '#2ecc71',
+                    'put_theta': '#f39c12'
+                }
+            )
+            fig.add_vline(x=spot_price, line_dash="dash", line_color="gray")
+            st.plotly_chart(fig, use_container_width=True)
+    
+    with tab4:
+        st.markdown("### Predictive Models & ML Signals")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # ML Model Feature Importance
+            st.markdown("#### Model Feature Importance")
+            feature_importance = trade_model.feature_importance()
+            if feature_importance is not None:
+                features = [
+                    'IV Skew', 'Call OI Change', 'Put OI Change', 
+                    'Call Spread %', 'Put Spread %', 'Call Volume', 
+                    'Put Volume', '% OTM Call', '% OTM Put',
+                    'Call Gamma', 'Put Gamma'
+                ]
+                importance_df = pd.DataFrame({
+                    'Feature': features,
+                    'Importance': feature_importance
+                }).sort_values('Importance', ascending=False)
+                
+                fig = px.bar(
+                    importance_df,
+                    x='Importance',
+                    y='Feature',
+                    orientation='h',
+                    title='Feature Importance in Trade Model'
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Model not trained or feature importance not available")
+            
+            # ML Scores Distribution
+            st.markdown("#### ML Scores Distribution")
+            if 'ml_score' in df_with_scores.columns:
+                fig = px.histogram(
+                    df_with_scores,
+                    x='ml_score',
+                    nbins=20,
+                    title='Distribution of ML Scores Across Strikes',
+                    labels={'ml_score': 'ML Score (0-1)'}
+                )
+                st.plotly_chart(fig, use_container_width=True)
+        
+        with col2:
+            # Top ML-Scored Calls
+            st.markdown("#### Top ML-Scored Calls")
+            top_calls = df_with_scores[df_with_scores['call_moneyness'] == 'OTM'].sort_values('ml_score', ascending=False).head(10)
+            st.dataframe(
+                top_calls[['strike', 'call_ltp', 'call_iv', 'call_oi_change', 'ml_score']]
+                .rename(columns={
+                    'strike': 'Strike',
+                    'call_ltp': 'Price',
+                    'call_iv': 'IV',
+                    'call_oi_change': 'OI Change',
+                    'ml_score': 'ML Score'
+                })
+                .style.format({
+                    'Price': '{:.2f}',
+                    'IV': '{:.1f}%',
+                    'OI Change': '{:,}',
+                    'ML Score': '{:.2f}'
+                }),
+                use_container_width=True
+            )
+            
+            # Top ML-Scored Puts
+            st.markdown("#### Top ML-Scored Puts")
+            top_puts = df_with_scores[df_with_scores['put_moneyness'] == 'OTM'].sort_values('ml_score', ascending=False).head(10)
+            st.dataframe(
+                top_puts[['strike', 'put_ltp', 'put_iv', 'put_oi_change', 'ml_score']]
+                .rename(columns={
+                    'strike': 'Strike',
+                    'put_ltp': 'Price',
+                    'put_iv': 'IV',
+                    'put_oi_change': 'OI Change',
+                    'ml_score': 'ML Score'
+                })
+                .style.format({
+                    'Price': '{:.2f}',
+                    'IV': '{:.1f}%',
+                    'OI Change': '{:,}',
+                    'ML Score': '{:.2f}'
+                }),
+                use_container_width=True
+            )
 
 if __name__ == "__main__":
     main()
