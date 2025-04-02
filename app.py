@@ -610,18 +610,19 @@ def main():
         st.warning(f"Could not determine market regime: {str(e)}")
     
     # Smart Money Flow
-    try:
-        smart_money = detect_smart_money_flow(df)
-        if smart_money:
-            st.markdown("### Smart Money Flow")
-            for flow in smart_money:
+try:
+    smart_money = detect_smart_money_flow(df)
+    if smart_money:
+        st.markdown("### Smart Money Flow")
+        for flow in smart_money:
+            if flow[1]:  # Check if strike list is not empty
                 st.markdown(f"""
                     <div class='smart-money'>
                         <b>{flow[0]}</b> detected at strikes: {', '.join(map(str, flow[1]))}
                     </div>
                 """, unsafe_allow_html=True)
-    except Exception as e:
-        st.warning(f"Could not detect smart money flow: {str(e)}")
+except Exception as e:
+    st.warning(f"Could not analyze smart money flow: {str(e)}")
     
     # Top Strikes Section
     st.markdown("### Top ITM/OTM Strike Prices")
