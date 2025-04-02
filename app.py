@@ -4,14 +4,12 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 from datetime import datetime
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
 from hmmlearn.hmm import GaussianHMM
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
-import json
 from scipy.stats import norm
 import warnings
+
 warnings.filterwarnings('ignore')
 
 # Configure page
@@ -119,35 +117,77 @@ HEADERS = {
 }
 
 # Constants
-RISK_FREE_RATE = 0.05  # 5% risk-free rate for calculations
+RISK_FREE_RATE = 0.05
 DAYS_IN_YEAR = 365
 
-# Fetch data from API
-@st.cache_data(ttl=300)
+# Machine Learning Model for Trade Signals
+class OptionTradeModel:
+    def __init__(self):
+        self.model = GradientBoostingClassifier(n_estimators=100, learning_rate=0.1, max_depth=3, random_state=42)
+        self.scaler = StandardScaler()
+        self.trained = False
+        
+    def prepare_features(self, df, spot_price):
+        features = []
+        for _, row in df.iterrows():
+            features.append([
+                row['call_iv'] - row['put_iv'],
+                row['call_oi_change'],
+                row['put_oi_change'],
+                (row['call_ask'] - row['call_bid']) / row['call_ltp'] if row['call_ltp'] > 0 else 0,
+                (row['put_ask'] - row['put_bid']) / row['put_ltp'] if row['put_ltp'] > 0 else 0,
+                row['call_volume'] / (df['call_volume'].max() + 1e-6),
+                row['put_volume'] / (df['put_volume'].max() + 1e-6),
+                (spot_price - row['strike']) / spot_price if row['call_moneyness'] == 'OTM' else 0,
+                (row['strike'] - spot_price) / spot_price if row['put_moneyness'] == 'OTM' else 0,
+                row['call_gamma'],
+                row['put_gamma']
+            ])
+        return np.array(features)
+    
+    def train(self, X, y):
+        X_scaled = self.scaler.fit_transform(X)
+        self.model.fit(X_scaled, y)
+        self.trained = True
+        
+    def predict(self, X):
+        if not self.trained:
+            return np.zeros(X.shape[0])
+        X_scaled = self.scaler.transform(X)
+        return self.model.predict_proba(X_scaled)[:, 1]
+    
+    def feature_importance(self):
+        if not self.trained:
+            return None
+        return self.model.feature_importances_
+
+# Market Regime Detection
+class MarketRegimeDetector:
+    def __init__(self, n_states=3):
+        self.model = GaussianHMM(n_components=n_states, covariance_type="diag", n_iter=1000, random_state=42)
+        self.regime_map = {0: "Low Volatility", 1: "Normal", 2: "High Volatility"}
+        
+    def fit(self, historical_data):
+        self.model.fit(historical_data[['iv', 'volume', 'returns']].values.reshape(-1, 3))
+        
+    def predict_regime(self, current_data):
+        regime = self.model.predict(np.array([[current_data['iv'], current_data['volume'], current_data['returns']]]))
+        return self.regime_map[regime[0]]
+    
+    def get_expected_move(self, current_iv, days_to_expiry):
+        return current_iv * np.sqrt(days_to_expiry / DAYS_IN_YEAR)
+
+# Helper Functions
 def fetch_options_data(asset_key="NSE_INDEX|Nifty 50", expiry="03-04-2025"):
     url = f"{BASE_URL}/strategy-chains?assetKey={asset_key}&strategyChainType=PC_CHAIN&expiry={expiry}"
     response = requests.get(url, headers=HEADERS)
-    
-    if response.status_code == 200:
-        return response.json()
-    else:
-        st.error(f"Failed to fetch data: {response.status_code} - {response.text}")
-        return None
+    return response.json() if response.status_code == 200 else None
 
-# Fetch live Nifty price
-@st.cache_data(ttl=60)
 def fetch_nifty_price():
     url = f"{MARKET_DATA_URL}?i=NSE_INDEX|Nifty%2050"
     response = requests.get(url, headers=HEADERS)
-    
-    if response.status_code == 200:
-        data = response.json()
-        return data['data']['lastPrice']
-    else:
-        st.error(f"Failed to fetch Nifty price: {response.status_code} - {response.text}")
-        return None
+    return response.json()['data']['lastPrice'] if response.status_code == 200 else None
 
-# Process raw API data
 def process_options_data(raw_data, spot_price):
     if not raw_data or 'data' not in raw_data:
         return None
@@ -159,11 +199,8 @@ def process_options_data(raw_data, spot_price):
         call_data = data.get('callOptionData', {})
         put_data = data.get('putOptionData', {})
         
-        # Market data
         call_market = call_data.get('marketData', {})
         put_market = put_data.get('marketData', {})
-        
-        # Analytics data
         call_analytics = call_data.get('analytics', {})
         put_analytics = put_data.get('analytics', {})
         
@@ -172,12 +209,8 @@ def process_options_data(raw_data, spot_price):
         processed_data.append({
             'strike': strike_float,
             'pcr': data.get('pcr', 0),
-            
-            # Moneyness
             'call_moneyness': 'ITM' if strike_float < spot_price else ('ATM' if strike_float == spot_price else 'OTM'),
             'put_moneyness': 'ITM' if strike_float > spot_price else ('ATM' if strike_float == spot_price else 'OTM'),
-            
-            # Call data
             'call_ltp': call_market.get('ltp', 0),
             'call_bid': call_market.get('bidPrice', 0),
             'call_ask': call_market.get('askPrice', 0),
@@ -190,8 +223,6 @@ def process_options_data(raw_data, spot_price):
             'call_gamma': call_analytics.get('gamma', 0),
             'call_theta': call_analytics.get('theta', 0),
             'call_vega': call_analytics.get('vega', 0),
-            
-            # Put data
             'put_ltp': put_market.get('ltp', 0),
             'put_bid': put_market.get('bidPrice', 0),
             'put_ask': put_market.get('askPrice', 0),
@@ -207,242 +238,6 @@ def process_options_data(raw_data, spot_price):
         })
     
     return pd.DataFrame(processed_data)
-
-# Get top ITM/OTM strikes
-def get_top_strikes(df, spot_price, n=5):
-    call_itm = df[df['strike'] < spot_price].sort_values('strike', ascending=False).head(n)
-    call_otm = df[df['strike'] > spot_price].sort_values('strike', ascending=True).head(n)
-    put_itm = df[df['strike'] > spot_price].sort_values('strike', ascending=True).head(n)
-    put_otm = df[df['strike'] < spot_price].sort_values('strike', ascending=False).head(n)
-    
-    return {
-        'call_itm': call_itm,
-        'call_otm': call_otm,
-        'put_itm': put_itm,
-        'put_otm': put_otm
-    }
-
-# Machine Learning Model for Trade Signals
-class OptionTradeModel:
-    def __init__(self):
-        self.model = GradientBoostingClassifier(n_estimators=100, learning_rate=0.1, max_depth=3, random_state=42)
-        self.scaler = StandardScaler()
-        self.trained = False
-        
-    def prepare_features(self, df, spot_price):
-        features = []  # Initialize the features list
-        for _, row in df.iterrows():
-            features.append([
-                row['call_iv'] - row['put_iv'],  # IV Skew
-                row['call_oi_change'],
-                row['put_oi_change'],
-                (row['call_ask'] - row['call_bid']) / row['call_ltp'] if row['call_ltp'] > 0 else 0,  # Call spread %
-                (row['put_ask'] - row['put_bid']) / row['put_ltp'] if row['put_ltp'] > 0 else 0,  # Put spread %
-                row['call_volume'] / (df['call_volume'].max() + 1e-6),  # Normalized volume
-                row['put_volume'] / (df['put_volume'].max() + 1e-6),
-                (spot_price - row['strike']) / spot_price if row['call_moneyness'] == 'OTM' else 0,  # % OTM for calls
-                (row['strike'] - spot_price) / spot_price if row['put_moneyness'] == 'OTM' else 0,  # % OTM for puts
-                row['call_gamma'],
-                row['put_gamma']
-            ])
-        return np.array(features)
-    
-    def train(self, X, y):
-        X_scaled = self.scaler.fit_transform(X)
-        self.model.fit(X_scaled, y)
-        self.trained = True
-        
-    def predict(self, X):
-        if not self.trained:
-            return np.zeros(X.shape[0])
-        X_scaled = self.scaler.transform(X)
-        return self.model.predict_proba(X_scaled)[:, 1]  # Probability of being a good buy
-    
-    def feature_importance(self):
-        if not self.trained:
-            return None
-        return self.model.feature_importances_
-
-# Market Regime Detection using HMM
-class MarketRegimeDetector:
-    def __init__(self, n_states=3):
-        self.model = GaussianHMM(n_components=n_states, covariance_type="diag", n_iter=1000, random_state=42)
-        self.regime_map = {0: "Low Volatility", 1: "Normal", 2: "High Volatility"}
-        
-    def fit(self, historical_data):
-        # historical_data should be a DataFrame with columns: ['iv', 'volume', 'returns']
-        self.model.fit(historical_data[['iv', 'volume', 'returns']].values.reshape(-1, 3))
-        
-    def predict_regime(self, current_data):
-        # current_data should be a dict with: {'iv': x, 'volume': y, 'returns': z}
-        regime = self.model.predict(np.array([[current_data['iv'], current_data['volume'], current_data['returns']]]))
-        return self.regime_map[regime[0]]
-    
-    def get_expected_move(self, current_iv, days_to_expiry):
-        # Calculate expected move based on IV
-        return current_iv * np.sqrt(days_to_expiry / DAYS_IN_YEAR)
-
-# Arbitrage Detection
-def detect_arbitrage_opportunities(df, spot_price, risk_free_rate, days_to_expiry):
-    arbitrage_ops = []
-    for _, row in df.iterrows():
-        strike = row['strike']
-        call_price = row['call_ltp']
-        put_price = row['put_ltp']
-        
-        # Put-call parity: C - P = S - K*e^(-rT)
-        theoretical_diff = spot_price - strike * np.exp(-risk_free_rate * days_to_expiry / DAYS_IN_YEAR)
-        actual_diff = call_price - put_price
-        
-        # Arbitrage opportunities
-        if abs(actual_diff - theoretical_diff) > max(5, 0.05 * spot_price):  # Threshold
-            arbitrage_ops.append({
-                'strike': strike,
-                'call_price': call_price,
-                'put_price': put_price,
-                'theoretical_diff': theoretical_diff,
-                'actual_diff': actual_diff,
-                'arbitrage_amount': abs(actual_diff - theoretical_diff),
-                'direction': 'Buy Put + Sell Call' if actual_diff > theoretical_diff else 'Buy Call + Sell Put'
-            })
-    
-    return pd.DataFrame(arbitrage_ops).sort_values('arbitrage_amount', ascending=False)
-
-# Probability of Profit Calculator
-def calculate_probability_of_profit(option_type, strike, premium, spot_price, iv, days_to_expiry):
-    if option_type == 'call':
-        break_even = strike + premium
-        expected_move = spot_price * iv * np.sqrt(days_to_expiry / DAYS_IN_YEAR)
-        z_score = (break_even - spot_price) / (spot_price * iv * np.sqrt(days_to_expiry / DAYS_IN_YEAR))
-    else:  # put
-        break_even = strike - premium
-        expected_move = spot_price * iv * np.sqrt(days_to_expiry / DAYS_IN_YEAR)
-        z_score = (spot_price - break_even) / (spot_price * iv * np.sqrt(days_to_expiry / DAYS_IN_YEAR))
-    
-    return 1 - norm.cdf(z_score)
-
-# Smart Money Flow Detection
-def detect_smart_money_flows(df, spot_price, volume_threshold, oi_change_threshold):
-    smart_money = []
-    
-    # Criteria for institutional activity
-    for _, row in df.iterrows():
-        # Call side smart money detection
-        if (row['call_volume'] > volume_threshold and 
-            row['call_oi_change'] > oi_change_threshold and 
-            row['call_iv'] < df['call_iv'].median()):
-            smart_money.append({
-                'strike': row['strike'],
-                'side': 'Call',
-                'volume': row['call_volume'],
-                'oi_change': row['call_oi_change'],
-                'iv': row['call_iv'],
-                'signal': 'Institutional Buying' if row['call_ltp'] > (row['call_bid'] + row['call_ask']) / 2 else 'Institutional Selling'
-            })
-        
-        # Put side smart money detection
-        if (row['put_volume'] > volume_threshold and 
-            row['put_oi_change'] > oi_change_threshold and 
-            row['put_iv'] < df['put_iv'].median()):
-            smart_money.append({
-                'strike': row['strike'],
-                'side': 'Put',
-                'volume': row['put_volume'],
-                'oi_change': row['put_oi_change'],
-                'iv': row['put_iv'],
-                'signal': 'Institutional Buying' if row['put_ltp'] > (row['put_bid'] + row['put_ask']) / 2 else 'Institutional Selling'
-            })
-    
-    return pd.DataFrame(smart_money).sort_values(['volume', 'oi_change'], ascending=False)
-
-# Generate trade recommendations with ML signals
-def generate_trade_recommendations(df, spot_price, model, days_to_expiry=1):
-    recommendations = []
-    
-    # Prepare features for ML model
-    def prepare_features(self, df, spot_price):
-    features = []  # Initialize the features list
-    for _, row in df.iterrows():
-        features.append([
-            row['call_iv'] - row['put_iv'],  # IV Skew
-            row['call_oi_change'],
-            row['put_oi_change'],
-            (row['call_ask'] - row['call_bid']) / row['call_ltp'] if row['call_ltp'] > 0 else 0,  # Call spread %
-            (row['put_ask'] - row['put_bid']) / row['put_ltp'] if row['put_ltp'] > 0 else 0,  # Put spread %
-            row['call_volume'] / (df['call_volume'].max() + 1e-6),  # Normalized volume
-            row['put_volume'] / (df['put_volume'].max() + 1e-6),
-            (spot_price - row['strike']) / spot_price if row['call_moneyness'] == 'OTM' else 0,  # % OTM for calls
-            (row['strike'] - spot_price) / spot_price if row['put_moneyness'] == 'OTM' else 0,  # % OTM for puts
-            row['call_gamma'],
-            row['put_gamma']
-        ])
-    return np.array(features)
-    
-    # Get top ML-scored calls and puts
-    top_calls = df[df['call_moneyness'] == 'OTM'].sort_values('ml_score', ascending=False).head(3)
-    top_puts = df[df['put_moneyness'] == 'OTM'].sort_values('ml_score', ascending=False).head(3)
-    
-    # Generate recommendations with ML signals
-    for _, row in top_calls.iterrows():
-        pop = calculate_probability_of_profit('call', row['strike'], row['call_ltp'], spot_price, row['call_iv'], days_to_expiry)
-        recommendations.append({
-            'type': 'BUY CALL',
-            'strike': row['strike'],
-            'premium': row['call_ltp'],
-            'iv': row['call_iv'],
-            'oi_change': row['call_oi_change'],
-            'ml_score': row['ml_score'],
-            'pop': pop,
-            'reason': f"ML Score: {row['ml_score']:.2f}, Prob of Profit: {pop:.1%}"
-        })
-    
-    for _, row in top_puts.iterrows():
-        pop = calculate_probability_of_profit('put', row['strike'], row['put_ltp'], spot_price, row['put_iv'], days_to_expiry)
-        recommendations.append({
-            'type': 'BUY PUT',
-            'strike': row['strike'],
-            'premium': row['put_ltp'],
-            'iv': row['put_iv'],
-            'oi_change': row['put_oi_change'],
-            'ml_score': row['ml_score'],
-            'pop': pop,
-            'reason': f"ML Score: {row['ml_score']:.2f}, Prob of Profit: {pop:.1%}"
-        })
-    
-    # Find overpriced options to sell (high IV percentile)
-    high_iv_calls = df[(df['call_moneyness'] == 'ITM') & 
-                      (df['call_iv'] > df['call_iv'].quantile(0.75))].sort_values('call_iv', ascending=False).head(2)
-    
-    for _, row in high_iv_calls.iterrows():
-        pop = calculate_probability_of_profit('call', row['strike'], row['call_ltp'], spot_price, row['call_iv'], days_to_expiry)
-        recommendations.append({
-            'type': 'SELL CALL',
-            'strike': row['strike'],
-            'premium': row['call_ltp'],
-            'iv': row['call_iv'],
-            'oi_change': row['call_oi_change'],
-            'ml_score': 1 - row['ml_score'],
-            'pop': pop,
-            'reason': f"High IV ({row['call_iv']:.1f}%), Prob of Profit: {pop:.1%}"
-        })
-    
-    high_iv_puts = df[(df['put_moneyness'] == 'ITM') & 
-                     (df['put_iv'] > df['put_iv'].quantile(0.75))].sort_values('put_iv', ascending=False).head(2)
-    
-    for _, row in high_iv_puts.iterrows():
-        pop = calculate_probability_of_profit('put', row['strike'], row['put_ltp'], spot_price, row['put_iv'], days_to_expiry)
-        recommendations.append({
-            'type': 'SELL PUT',
-            'strike': row['strike'],
-            'premium': row['put_ltp'],
-            'iv': row['put_iv'],
-            'oi_change': row['put_oi_change'],
-            'ml_score': 1 - row['ml_score'],
-            'pop': pop,
-            'reason': f"High IV ({row['put_iv']:.1f}%), Prob of Profit: {pop:.1%}"
-        })
-    
-    return recommendations, df
 
 # Main App
 def main():
