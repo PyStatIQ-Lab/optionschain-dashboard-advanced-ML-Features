@@ -193,17 +193,23 @@ def process_options_data(raw_data, spot_price):
 
 # Get top ITM/OTM strikes
 def get_top_strikes(df, spot_price, n=5):
-    call_itm = df[df['strike'] < spot_price].sort_values('strike', ascending=False).head(n)
-    call_otm = df[df['strike'] > spot_price].sort_values('strike', ascending=True).head(n)
-    put_itm = df[df['strike'] > spot_price].sort_values('strike', ascending=True).head(n)
-    put_otm = df[df['strike'] < spot_price].sort_values('strike', ascending=False).head(n)
-    
-    return {
-        'call_itm': call_itm,
-        'call_otm': call_otm,
-        'put_itm': put_itm,
-        'put_otm': put_otm
+    result = {
+        'call_itm': pd.DataFrame(),
+        'call_otm': pd.DataFrame(),
+        'put_itm': pd.DataFrame(),
+        'put_otm': pd.DataFrame()
     }
+    
+    try:
+        if df is not None and not df.empty:
+            result['call_itm'] = df[df['strike'] < spot_price].sort_values('strike', ascending=False).head(n)
+            result['call_otm'] = df[df['strike'] > spot_price].sort_values('strike', ascending=True).head(n)
+            result['put_itm'] = df[df['strike'] > spot_price].sort_values('strike', ascending=True).head(n)
+            result['put_otm'] = df[df['strike'] < spot_price].sort_values('strike', ascending=False).head(n)
+    except Exception as e:
+        st.warning(f"Error processing top strikes: {str(e)}")
+    
+    return result
 
 # Probability of Profit Calculator
 def calculate_probability_of_profit(row, spot_price, option_type='call'):
@@ -488,6 +494,8 @@ def generate_trade_recommendations(df, spot_price):
     return recommendations
 
 # Main App
+# In your main() function, replace the relevant sections with this:
+
 def main():
     st.markdown("<div class='header'><h1>📊 Upstox Options Chain Dashboard</h1></div>", unsafe_allow_html=True)
     
@@ -496,32 +504,6 @@ def main():
     if spot_price is None:
         st.error("Failed to fetch Nifty spot price. Using default value.")
         spot_price = 22000  # Default fallback
-    
-    # Sidebar controls
-    with st.sidebar:
-        st.header("Filters")
-        asset_key = st.selectbox(
-            "Underlying Asset",
-            ["NSE_INDEX|Nifty 50", "NSE_INDEX|Bank Nifty"],
-            index=0
-        )
-        
-        expiry_date = st.date_input(
-            "Expiry Date",
-            datetime.strptime("03-04-2025", "%d-%m-%Y")
-        ).strftime("%d-%m-%Y")
-        
-        st.markdown("---")
-        st.markdown(f"**Current Nifty Spot Price: {spot_price:,.2f}**")
-        
-        st.markdown("---")
-        st.markdown("**Analysis Settings**")
-        volume_threshold = st.number_input("High Volume Threshold", value=5000000)
-        oi_change_threshold = st.number_input("Significant OI Change", value=1000000)
-        
-        st.markdown("---")
-        st.markdown("**About**")
-        st.markdown("This dashboard provides real-time options chain analysis using Upstox API data.")
     
     # Fetch and process data
     with st.spinner("Fetching live options data..."):
@@ -536,78 +518,78 @@ def main():
         st.error("No data available for the selected parameters.")
         return
     
-    # Get top strikes
-    top_strikes = get_top_strikes(df, spot_price)
-    
-    # Default strike selection (ATM)
-    atm_strike = df.iloc[(df['strike'] - spot_price).abs().argsort()[:1]]['strike'].values[0]
-    
-    # Main columns
-    col1, col2, col3 = st.columns([1, 2, 1])
-    
-    with col1:
-        st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
-        st.markdown("**Total Call OI**")
-        total_call_oi = df['call_oi'].sum()
-        st.markdown(f"<h2>{total_call_oi:,}</h2>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-        
-        st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
-        st.markdown("**Total Put OI**")
-        total_put_oi = df['put_oi'].sum()
-        st.markdown(f"<h2>{total_put_oi:,}</h2>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-    
-    with col2:
-        # Strike price selector
-        selected_strike = st.selectbox(
-            "Select Strike Price",
-            df['strike'].unique(),
-            index=int(np.where(df['strike'].unique() == atm_strike)[0][0])
-        )
-        
-        # PCR gauge
-        pcr = df[df['strike'] == selected_strike]['pcr'].values[0]
-        fig = px.bar(x=[pcr], range_x=[0, 2], title=f"Put-Call Ratio: {pcr:.2f}")
-        fig.update_layout(
-            xaxis_title="PCR",
-            yaxis_visible=False,
-            height=150,
-            margin=dict(l=20, r=20, t=40, b=20)
-        )
-        fig.add_vline(x=0.7, line_dash="dot", line_color="green")
-        fig.add_vline(x=1.3, line_dash="dot", line_color="red")
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col3:
-        st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
-        st.markdown("**Call OI Change**")
-        call_oi_change = df[df['strike'] == selected_strike]['call_oi_change'].values[0]
-        change_color = "positive" if call_oi_change > 0 else "negative"
-        st.markdown(f"<h2 class='{change_color}'>{call_oi_change:,}</h2>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-        
-        st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
-        st.markdown("**Put OI Change**")
-        put_oi_change = df[df['strike'] == selected_strike]['put_oi_change'].values[0]
-        change_color = "positive" if put_oi_change > 0 else "negative"
-        st.markdown(f"<h2 class='{change_color}'>{put_oi_change:,}</h2>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-    
-    # Market Regime Analysis
+    # Get top strikes - ADDED VALIDATION
     try:
-        regime = detect_market_regime(df['call_iv'].values)
-        regimes = ["Low Volatility", "Normal", "High Volatility"]
-        regime_class = ["regime-low", "regime-normal", "regime-high"][regime]
+        top_strikes = get_top_strikes(df, spot_price) if df is not None else {}
         
-        st.markdown(f"""
-            <div class='{regime_class}'>
-                <h3>Market Regime: {regimes[regime]}</h3>
-                <p>Implied Volatility: {df['call_iv'].mean():.1f}% | Expected Daily Move: ±{calculate_expected_move(spot_price, df['call_iv'].mean()):.1f} points</p>
-            </div>
-        """, unsafe_allow_html=True)
+        # Display Top Strikes Section - ADDED VALIDATION
+        if top_strikes and all(k in top_strikes for k in ['call_itm', 'call_otm', 'put_itm', 'put_otm']):
+            st.markdown("### Top ITM/OTM Strike Prices")
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.markdown("**Top ITM Call Strikes**")
+                for _, row in top_strikes['call_itm'].iterrows():
+                    st.markdown(f"""
+                        <div class='strike-card'>
+                            <b>{row['strike']:.0f}</b> (LTP: {row['call_ltp']:.2f})<br>
+                            OI: {row['call_oi']:,} (Δ: {row['call_oi_change']:,})<br>
+                            IV: {row['call_iv']:.1f}%
+                        </div>
+                    """, unsafe_allow_html=True)
+            
+            with col2:
+                st.markdown("**Top OTM Call Strikes**")
+                for _, row in top_strikes['call_otm'].iterrows():
+                    st.markdown(f"""
+                        <div class='strike-card'>
+                            <b>{row['strike']:.0f}</b> (LTP: {row['call_ltp']:.2f})<br>
+                            OI: {row['call_oi']:,} (Δ: {row['call_oi_change']:,})<br>
+                            IV: {row['call_iv']:.1f}%
+                        </div>
+                    """, unsafe_allow_html=True)
+            
+            with col3:
+                st.markdown("**Top ITM Put Strikes**")
+                for _, row in top_strikes['put_itm'].iterrows():
+                    st.markdown(f"""
+                        <div class='strike-card'>
+                            <b>{row['strike']:.0f}</b> (LTP: {row['put_ltp']:.2f})<br>
+                            OI: {row['put_oi']:,} (Δ: {row['put_oi_change']:,})<br>
+                            IV: {row['put_iv']:.1f}%
+                        </div>
+                    """, unsafe_allow_html=True)
+            
+            with col4:
+                st.markdown("**Top OTM Put Strikes**")
+                for _, row in top_strikes['put_otm'].iterrows():
+                    st.markdown(f"""
+                        <div class='strike-card'>
+                            <b>{row['strike']:.0f}</b> (LTP: {row['put_ltp']:.2f})<br>
+                            OI: {row['put_oi']:,} (Δ: {row['put_oi_change']:,})<br>
+                            IV: {row['put_iv']:.1f}%
+                        </div>
+                    """, unsafe_allow_html=True)
+        else:
+            st.warning("Could not load top strikes data")
     except Exception as e:
-        st.warning(f"Could not determine market regime: {str(e)}")
+        st.error(f"Error displaying top strikes: {str(e)}")
+    
+    # Smart Money Flow Section - ADDED VALIDATION
+    try:
+        if df is not None:
+            smart_money = detect_smart_money_flow(df)
+            if smart_money:
+                st.markdown("### Smart Money Flow")
+                for flow in smart_money:
+                    if flow and len(flow) == 2 and flow[1]:  # Check if valid flow data
+                        st.markdown(f"""
+                            <div class='smart-money'>
+                                <b>{flow[0]}</b> detected at strikes: {', '.join(map(str, flow[1]))}
+                            </div>
+                        """, unsafe_allow_html=True)
+    except Exception as e:
+        st.error(f"Could not analyze smart money flow: {str(e)}")
     
     # Smart Money Flow
 try:
