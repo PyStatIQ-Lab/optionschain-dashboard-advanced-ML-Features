@@ -243,16 +243,16 @@ def detect_market_regime(historical_iv):
     try:
         # Remove NaN values and ensure we have enough data
         historical_iv = historical_iv[~np.isnan(historical_iv)]
-        if len(historical_iv) < 10:  # Need at least 10 data points
+        if len(historical_iv) < 10:
             return 1  # Return "Normal" regime if not enough data
         
         # Convert to daily changes
         returns = np.diff(np.log(historical_iv))
         
-        # Remove any infinite values that might have crept in
+        # Remove any infinite values
         returns = returns[np.isfinite(returns)]
         
-        if len(returns) < 2:  # Need at least 2 returns for HMM
+        if len(returns) < 2:
             return 1  # Return "Normal" regime if not enough data
             
         # Fit HMM model
@@ -262,10 +262,10 @@ def detect_market_regime(historical_iv):
         # Predict regimes
         regimes = model.predict(returns.reshape(-1,1))
         
-        return regimes[-1]  # Return current regime
+        return regimes[-1]
     except Exception as e:
         st.warning(f"Market regime detection failed: {str(e)}")
-        return 1  # Default to "Normal" regime if anything goes wrong
+        return 1
 
 # Put-Call Parity Arbitrage Detection
 def detect_arbitrage_opportunities(df, spot_price, risk_free_rate=0.05):
@@ -285,167 +285,190 @@ def detect_arbitrage_opportunities(df, spot_price, risk_free_rate=0.05):
     
     return sorted(arbitrage_ops, key=lambda x: abs(x['premium_diff']), reverse=True)
 
-# Smart Money Flow Identification
+# Smart Money Flow Identification - FIXED VERSION
 def detect_smart_money_flow(df):
     smart_money = []
     
-    # Institutional Call Buying
-    high_premium_calls = df[(df['call_oi_change'] > 0) & 
-                           (df['call_ltp'] > 1.5 * df['call_ltp'].median())]
-    if not high_premium_calls.empty:
-        smart_money.append(("Institutional Call Buying", high_premium_calls['strike'].values))
+    # Check if DataFrame is empty
+    if df.empty:
+        return smart_money
     
-    # Put Writing
-    put_writing = df[(df['put_oi_change'] < 0) & 
-                    (df['put_ltp'] > df['put_ltp'].quantile(0.75))]
-    if not put_writing.empty:
-        smart_money.append(("Put Writing (Bearish)", put_writing['strike'].values))
+    # Calculate median call premium
+    try:
+        median_call_premium = df['call_ltp'].median()
+        
+        # Institutional Call Buying
+        high_premium_calls = df[(df['call_oi_change'] > 0) & 
+                               (df['call_ltp'] > 1.5 * median_call_premium)]
+        if not high_premium_calls.empty:
+            smart_money.append(("Institutional Call Buying", high_premium_calls['strike'].tolist()))
+        
+        # Put Writing
+        put_writing = df[(df['put_oi_change'] < 0) & 
+                        (df['put_ltp'] > df['put_ltp'].quantile(0.75))]
+        if not put_writing.empty:
+            smart_money.append(("Put Writing (Bearish)", put_writing['strike'].tolist()))
+    
+    except Exception as e:
+        st.warning(f"Smart money detection failed: {str(e)}")
     
     return smart_money
 
 # Machine Learning Trade Signals
 def generate_ml_trade_signals(df, spot_price):
-    # Feature engineering
-    df['distance_from_spot'] = (df['strike'] - spot_price) / spot_price
-    df['iv_skew'] = df['call_iv'] - df['put_iv']
-    df['premium_ratio'] = (df['call_ask'] - df['call_bid']) / df['call_ltp']
-    
-    # Create labels (1 = good buy, 0 = avoid)
-    conditions = [
-        (df['call_oi_change'] > df['call_oi_change'].quantile(0.75)) &
-        (df['premium_ratio'] < 0.1) &
-        (df['call_iv'] < df['call_iv'].quantile(0.75)),
+    try:
+        # Feature engineering
+        df['distance_from_spot'] = (df['strike'] - spot_price) / spot_price
+        df['iv_skew'] = df['call_iv'] - df['put_iv']
+        df['premium_ratio'] = (df['call_ask'] - df['call_bid']) / df['call_ltp'].replace(0, 0.01)  # Handle division by zero
         
-        (df['put_oi_change'] > df['put_oi_change'].quantile(0.75)) &
-        (df['premium_ratio'] < 0.1) &
-        (df['put_iv'] < df['put_iv'].quantile(0.75))
-    ]
-    choices = [1, 1]
-    df['target'] = np.select(conditions, choices, default=0)
+        # Create labels (1 = good buy, 0 = avoid)
+        conditions = [
+            (df['call_oi_change'] > df['call_oi_change'].quantile(0.75)) &
+            (df['premium_ratio'] < 0.1) &
+            (df['call_iv'] < df['call_iv'].quantile(0.75)),
+            
+            (df['put_oi_change'] > df['put_oi_change'].quantile(0.75)) &
+            (df['premium_ratio'] < 0.1) &
+            (df['put_iv'] < df['put_iv'].quantile(0.75))
+        ]
+        choices = [1, 1]
+        df['target'] = np.select(conditions, choices, default=0)
+        
+        # Train model
+        features = ['distance_from_spot', 'iv_skew', 'premium_ratio', 
+                   'call_oi_change', 'put_oi_change', 'call_iv', 'put_iv']
+        X = df[features].fillna(0)
+        y = df['target']
+        
+        if len(X) > 0 and len(y) > 0:
+            model = GradientBoostingClassifier()
+            model.fit(X, y)
+            
+            # Generate predictions
+            df['ml_score'] = model.predict_proba(X)[:,1]
+            
+            return df.sort_values('ml_score', ascending=False)
     
-    # Train model
-    features = ['distance_from_spot', 'iv_skew', 'premium_ratio', 
-               'call_oi_change', 'put_oi_change', 'call_iv', 'put_iv']
-    X = df[features]
-    y = df['target']
+    except Exception as e:
+        st.error(f"ML signal generation failed: {str(e)}")
+        return df
     
-    model = GradientBoostingClassifier()
-    model.fit(X, y)
-    
-    # Generate predictions
-    df['ml_score'] = model.predict_proba(X)[:,1]
-    
-    return df.sort_values('ml_score', ascending=False)
+    return df
 
 # Generate trade recommendations
 def generate_trade_recommendations(df, spot_price):
     recommendations = []
     
-    # Calculate metrics for all strikes
-    df['call_premium_ratio'] = (df['call_ask'] - df['call_bid']) / df['call_ltp']
-    df['put_premium_ratio'] = (df['put_ask'] - df['put_bid']) / df['put_ltp']
-    df['call_risk_reward'] = (spot_price - df['strike'] + df['call_ltp']) / df['call_ltp']
-    df['put_risk_reward'] = (df['strike'] - spot_price + df['put_ltp']) / df['put_ltp']
-    
-    # Find best calls to buy
-    best_calls = df[(df['call_moneyness'] == 'OTM') & 
-                   (df['call_premium_ratio'] < 0.1) &
-                   (df['call_oi_change'] > 0)].sort_values(
-        by=['call_premium_ratio', 'call_oi_change'], 
-        ascending=[True, False]
-    ).head(3)
-    
-    for _, row in best_calls.iterrows():
-        pop = calculate_probability_of_profit(row, spot_price, 'call')
-        expected_move = calculate_expected_move(spot_price, row['call_iv'])
-        greeks_alerts = generate_greeks_alerts(row)
+    try:
+        # Calculate metrics for all strikes
+        df['call_premium_ratio'] = (df['call_ask'] - df['call_bid']) / df['call_ltp'].replace(0, 0.01)
+        df['put_premium_ratio'] = (df['put_ask'] - df['put_bid']) / df['put_ltp'].replace(0, 0.01)
+        df['call_risk_reward'] = (spot_price - df['strike'] + df['call_ltp']) / df['call_ltp'].replace(0, 0.01)
+        df['put_risk_reward'] = (df['strike'] - spot_price + df['put_ltp']) / df['put_ltp'].replace(0, 0.01)
         
-        recommendations.append({
-            'type': 'BUY CALL',
-            'strike': row['strike'],
-            'premium': row['call_ltp'],
-            'iv': row['call_iv'],
-            'oi_change': row['call_oi_change'],
-            'risk_reward': f"{row['call_risk_reward']:.1f}:1",
-            'probability_of_profit': f"{pop:.1f}%",
-            'expected_move': f"±{expected_move:.1f} points",
-            'greeks_alerts': greeks_alerts,
-            'reason': "Low spread, OI buildup, good risk/reward"
-        })
-    
-    # Find best puts to buy
-    best_puts = df[(df['put_moneyness'] == 'OTM') & 
-                  (df['put_premium_ratio'] < 0.1) &
-                  (df['put_oi_change'] > 0)].sort_values(
-        by=['put_premium_ratio', 'put_oi_change'], 
-        ascending=[True, False]
-    ).head(3)
-    
-    for _, row in best_puts.iterrows():
-        pop = calculate_probability_of_profit(row, spot_price, 'put')
-        expected_move = calculate_expected_move(spot_price, row['put_iv'])
-        greeks_alerts = generate_greeks_alerts(row)
+        # Find best calls to buy
+        best_calls = df[(df['call_moneyness'] == 'OTM') & 
+                       (df['call_premium_ratio'] < 0.1) &
+                       (df['call_oi_change'] > 0)].sort_values(
+            by=['call_premium_ratio', 'call_oi_change'], 
+            ascending=[True, False]
+        ).head(3)
         
-        recommendations.append({
-            'type': 'BUY PUT',
-            'strike': row['strike'],
-            'premium': row['put_ltp'],
-            'iv': row['put_iv'],
-            'oi_change': row['put_oi_change'],
-            'risk_reward': f"{row['put_risk_reward']:.1f}:1",
-            'probability_of_profit': f"{pop:.1f}%",
-            'expected_move': f"±{expected_move:.1f} points",
-            'greeks_alerts': greeks_alerts,
-            'reason': "Low spread, OI buildup, good risk/reward"
-        })
-    
-    # Find best calls to sell
-    best_sell_calls = df[(df['call_moneyness'] == 'ITM') & 
-                        (df['call_premium_ratio'] > 0.15) &
-                        (df['call_oi_change'] < 0)].sort_values(
-        by=['call_premium_ratio', 'call_oi_change'], 
-        ascending=[False, True]
-    ).head(2)
-    
-    for _, row in best_sell_calls.iterrows():
-        pop = calculate_probability_of_profit(row, spot_price, 'call')
-        greeks_alerts = generate_greeks_alerts(row)
+        for _, row in best_calls.iterrows():
+            pop = calculate_probability_of_profit(row, spot_price, 'call')
+            expected_move = calculate_expected_move(spot_price, row['call_iv'])
+            greeks_alerts = generate_greeks_alerts(row)
+            
+            recommendations.append({
+                'type': 'BUY CALL',
+                'strike': row['strike'],
+                'premium': row['call_ltp'],
+                'iv': row['call_iv'],
+                'oi_change': row['call_oi_change'],
+                'risk_reward': f"{row['call_risk_reward']:.1f}:1",
+                'probability_of_profit': f"{pop:.1f}%",
+                'expected_move': f"±{expected_move:.1f} points",
+                'greeks_alerts': greeks_alerts,
+                'reason': "Low spread, OI buildup, good risk/reward"
+            })
         
-        recommendations.append({
-            'type': 'SELL CALL',
-            'strike': row['strike'],
-            'premium': row['call_ltp'],
-            'iv': row['call_iv'],
-            'oi_change': row['call_oi_change'],
-            'risk_reward': f"{1/row['call_risk_reward']:.1f}:1",
-            'probability_of_profit': f"{100-pop:.1f}%",
-            'greeks_alerts': greeks_alerts,
-            'reason': "High spread, OI unwinding, favorable risk"
-        })
-    
-    # Find best puts to sell
-    best_sell_puts = df[(df['put_moneyness'] == 'ITM') & 
-                       (df['put_premium_ratio'] > 0.15) &
-                       (df['put_oi_change'] < 0)].sort_values(
-        by=['put_premium_ratio', 'put_oi_change'], 
-        ascending=[False, True]
-    ).head(2)
-    
-    for _, row in best_sell_puts.iterrows():
-        pop = calculate_probability_of_profit(row, spot_price, 'put')
-        greeks_alerts = generate_greeks_alerts(row)
+        # Find best puts to buy
+        best_puts = df[(df['put_moneyness'] == 'OTM') & 
+                      (df['put_premium_ratio'] < 0.1) &
+                      (df['put_oi_change'] > 0)].sort_values(
+            by=['put_premium_ratio', 'put_oi_change'], 
+            ascending=[True, False]
+        ).head(3)
         
-        recommendations.append({
-            'type': 'SELL PUT',
-            'strike': row['strike'],
-            'premium': row['put_ltp'],
-            'iv': row['put_iv'],
-            'oi_change': row['put_oi_change'],
-            'risk_reward': f"{1/row['put_risk_reward']:.1f}:1",
-            'probability_of_profit': f"{100-pop:.1f}%",
-            'greeks_alerts': greeks_alerts,
-            'reason': "High spread, OI unwinding, favorable risk"
-        })
+        for _, row in best_puts.iterrows():
+            pop = calculate_probability_of_profit(row, spot_price, 'put')
+            expected_move = calculate_expected_move(spot_price, row['put_iv'])
+            greeks_alerts = generate_greeks_alerts(row)
+            
+            recommendations.append({
+                'type': 'BUY PUT',
+                'strike': row['strike'],
+                'premium': row['put_ltp'],
+                'iv': row['put_iv'],
+                'oi_change': row['put_oi_change'],
+                'risk_reward': f"{row['put_risk_reward']:.1f}:1",
+                'probability_of_profit': f"{pop:.1f}%",
+                'expected_move': f"±{expected_move:.1f} points",
+                'greeks_alerts': greeks_alerts,
+                'reason': "Low spread, OI buildup, good risk/reward"
+            })
+        
+        # Find best calls to sell
+        best_sell_calls = df[(df['call_moneyness'] == 'ITM') & 
+                            (df['call_premium_ratio'] > 0.15) &
+                            (df['call_oi_change'] < 0)].sort_values(
+            by=['call_premium_ratio', 'call_oi_change'], 
+            ascending=[False, True]
+        ).head(2)
+        
+        for _, row in best_sell_calls.iterrows():
+            pop = calculate_probability_of_profit(row, spot_price, 'call')
+            greeks_alerts = generate_greeks_alerts(row)
+            
+            recommendations.append({
+                'type': 'SELL CALL',
+                'strike': row['strike'],
+                'premium': row['call_ltp'],
+                'iv': row['call_iv'],
+                'oi_change': row['call_oi_change'],
+                'risk_reward': f"{1/row['call_risk_reward']:.1f}:1",
+                'probability_of_profit': f"{100-pop:.1f}%",
+                'greeks_alerts': greeks_alerts,
+                'reason': "High spread, OI unwinding, favorable risk"
+            })
+        
+        # Find best puts to sell
+        best_sell_puts = df[(df['put_moneyness'] == 'ITM') & 
+                           (df['put_premium_ratio'] > 0.15) &
+                           (df['put_oi_change'] < 0)].sort_values(
+            by=['put_premium_ratio', 'put_oi_change'], 
+            ascending=[False, True]
+        ).head(2)
+        
+        for _, row in best_sell_puts.iterrows():
+            pop = calculate_probability_of_profit(row, spot_price, 'put')
+            greeks_alerts = generate_greeks_alerts(row)
+            
+            recommendations.append({
+                'type': 'SELL PUT',
+                'strike': row['strike'],
+                'premium': row['put_ltp'],
+                'iv': row['put_iv'],
+                'oi_change': row['put_oi_change'],
+                'risk_reward': f"{1/row['put_risk_reward']:.1f}:1",
+                'probability_of_profit': f"{100-pop:.1f}%",
+                'greeks_alerts': greeks_alerts,
+                'reason': "High spread, OI unwinding, favorable risk"
+            })
+    
+    except Exception as e:
+        st.error(f"Trade recommendation generation failed: {str(e)}")
     
     return recommendations
 
@@ -557,30 +580,33 @@ def main():
         st.markdown("</div>", unsafe_allow_html=True)
     
     # Market Regime Analysis
-try:
-    regime = detect_market_regime(df['call_iv'].values)
-    regimes = ["Low Volatility", "Normal", "High Volatility"]
-    regime_class = ["regime-low", "regime-normal", "regime-high"][regime]
-    
-    st.markdown(f"""
-        <div class='{regime_class}'>
-            <h3>Market Regime: {regimes[regime]}</h3>
-            <p>Implied Volatility: {df['call_iv'].mean():.1f}% | Expected Daily Move: ±{calculate_expected_move(spot_price, df['call_iv'].mean()):.1f} points</p>
-        </div>
-    """, unsafe_allow_html=True)
-except Exception as e:
-    st.warning(f"Could not determine market regime: {str(e)}")
+    try:
+        regime = detect_market_regime(df['call_iv'].values)
+        regimes = ["Low Volatility", "Normal", "High Volatility"]
+        regime_class = ["regime-low", "regime-normal", "regime-high"][regime]
+        
+        st.markdown(f"""
+            <div class='{regime_class}'>
+                <h3>Market Regime: {regimes[regime]}</h3>
+                <p>Implied Volatility: {df['call_iv'].mean():.1f}% | Expected Daily Move: ±{calculate_expected_move(spot_price, df['call_iv'].mean()):.1f} points</p>
+            </div>
+        """, unsafe_allow_html=True)
+    except Exception as e:
+        st.warning(f"Could not determine market regime: {str(e)}")
     
     # Smart Money Flow
-    smart_money = detect_smart_money_flow(df)
-    if smart_money:
-        st.markdown("### Smart Money Flow")
-        for flow in smart_money:
-            st.markdown(f"""
-                <div class='smart-money'>
-                    <b>{flow[0]}</b> detected at strikes: {', '.join(map(str, flow[1]))}
-                </div>
-            """, unsafe_allow_html=True)
+    try:
+        smart_money = detect_smart_money_flow(df)
+        if smart_money:
+            st.markdown("### Smart Money Flow")
+            for flow in smart_money:
+                st.markdown(f"""
+                    <div class='smart-money'>
+                        <b>{flow[0]}</b> detected at strikes: {', '.join(map(str, flow[1]))}
+                    </div>
+                """, unsafe_allow_html=True)
+    except Exception as e:
+        st.warning(f"Could not detect smart money flow: {str(e)}")
     
     # Top Strikes Section
     st.markdown("### Top ITM/OTM Strike Prices")
