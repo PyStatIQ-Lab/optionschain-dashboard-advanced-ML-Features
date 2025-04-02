@@ -230,7 +230,9 @@ class OptionTradeModel:
         self.trained = False
         
     def prepare_features(self, df, spot_price):
-        features.append([
+        features = []  # Initialize the features list
+        for _, row in df.iterrows():
+            features.append([
                 row['call_iv'] - row['put_iv'],  # IV Skew
                 row['call_oi_change'],
                 row['put_oi_change'],
